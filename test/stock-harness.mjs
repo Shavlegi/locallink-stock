@@ -305,17 +305,15 @@ let cookie = null;
   check('quote rejects qty 0', qty0.status === 400);
   const qty100 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'logo', qty: 100 }] } });
   check('quote rejects qty 100', qty100.status === 400);
-  const badPrice = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'site-build', qty: 1, price: -5 }] } });
-  check('quote rejects negative editable price', badPrice.status === 400);
-  const fracPrice = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'site-build', qty: 1, price: 50.5 }] } });
-  check('quote rejects fractional editable price', fracPrice.status === 400);
+  // Client-sent prices are ignored entirely (see end of this block);
+  // the two old editable-price rejection tests moved there.
   const crossQ = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example', ...auth }, body: { first_name: 'Nika', items: [{ id: 'logo', qty: 1 }] } });
   check('quotes POST rejects cross-site Origin', crossQ.status === 403);
 
-  // Fixed-price override must be ignored; editable price honored; totals split once/monthly.
-  const q1 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', last_name: 'Test', phone: '597 111 222', note: 'test note', items: [{ id: 'logo', qty: 2, price: 999 }, { id: 'site-build', qty: 1, price: 75 }, { id: 'm-care', qty: 1 }, { id: 'prod-nfc-stand', qty: 3 }] } });
+  // Client-sent prices ignored; totals split once/monthly.
+  const q1 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', last_name: 'Test', phone: '597 111 222', note: 'test note', items: [{ id: 'logo', qty: 2, price: 999 }, { id: 'site-build', qty: 1, price: 999 }, { id: 'm-care', qty: 1 }, { id: 'prod-nfc-stand', qty: 3 }] } });
   const q1Data = await q1.json();
-  check('quote create 200 with totals', q1.status === 200 && q1Data.total_once === 245 && q1Data.total_monthly === 25, JSON.stringify(q1Data));
+  check('quote create 200 with totals', q1.status === 200 && q1Data.total_once === 220 && q1Data.total_monthly === 25, JSON.stringify(q1Data));
   const q1id = q1Data.id;
   check('quote create returns numeric id', Number.isInteger(q1id) && q1id > 0, 'id=' + q1id);
 
@@ -324,7 +322,7 @@ let cookie = null;
   check('quotes list has the saved card', list1Data.quotes.length === 1 && list1Data.quotes[0].id === q1id);
   const card = list1Data.quotes[0];
   check('card keeps client fields', card.first_name === 'Nika' && card.last_name === 'Test' && card.phone === '597 111 222' && card.note === 'test note');
-  check('card items snapshot has names + enforced prices', card.items.length === 4 && card.items.find((i) => i.id === 'logo').price === 10 && card.items.find((i) => i.id === 'site-build').price === 75 && card.items.find((i) => i.id === 'prod-nfc-stand').qty === 3);
+  check('card items snapshot has names + enforced prices', card.items.length === 4 && card.items.find((i) => i.id === 'logo').price === 10 && card.items.find((i) => i.id === 'site-build').price === 50 && card.items.find((i) => i.id === 'prod-nfc-stand').qty === 3);
   check('card monthly flag on snapshot', card.items.find((i) => i.id === 'm-care').monthly === true && card.items.find((i) => i.id === 'logo').monthly === false);
 
   const q2 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Gio', items: [{ id: 'gbp-all', qty: 1 }] } });
@@ -363,6 +361,133 @@ let cookie = null;
   const partsOnly = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'gbp-create', qty: 1 }, { id: 'gbp-fill', qty: 1 }, { id: 'gbp-verify', qty: 1 }] } });
   const partsOnlyData = await partsOnly.json();
   check('quote accepts all three parts (60 total)', partsOnly.status === 200 && partsOnlyData.total_once === 60, JSON.stringify(partsOnlyData));
+
+  // Client-sent prices are IGNORED — quotes always use effective catalog prices.
+  const negPrice = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'site-build', qty: 1, price: -5 }] } });
+  const negPriceData = await negPrice.json();
+  check('quote ignores negative client-sent price (200 at effective price)', negPrice.status === 200 && negPriceData.total_once === 50, JSON.stringify(negPriceData));
+  const fracPrice = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'site-build', qty: 1, price: 50.5 }] } });
+  const fracPriceData = await fracPrice.json();
+  check('quote ignores fractional client-sent price (200 at effective price)', fracPrice.status === 200 && fracPriceData.total_once === 50, JSON.stringify(fracPriceData));
+  const sent999 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'site-build', qty: 1, price: 999 }] } });
+  const sent999Data = await sent999.json();
+  check('quote ignores client-sent 999 (200 at effective price)', sent999.status === 200 && sent999Data.total_once === 50, JSON.stringify(sent999Data));
+  const list4 = await req('GET', '/api/admin/quotes', { ip: '10.0.0.31', headers: auth });
+  const list4Data = await list4.json();
+  check('stored snapshot keeps effective price, not sent price', list4Data.quotes[0].items[0].id === 'site-build' && list4Data.quotes[0].items[0].price === 50);
+}
+
+// ---------- prices: overrides + public API ----------
+{
+  const auth = { Cookie: cookie };
+  const jsonHeaders = { 'Content-Type': 'application/json', ...auth };
+
+  const pub0 = await req('GET', '/api/prices', { ip: '10.0.0.40' });
+  const pub0Data = await pub0.json();
+  check('GET /api/prices 200 with empty overrides', pub0.status === 200 && pub0Data.prices && Object.keys(pub0Data.prices).length === 0, JSON.stringify(pub0Data));
+  check('GET /api/prices no-store', (pub0.headers.get('cache-control') || '') === 'no-store');
+  const corsP = await req('GET', '/api/prices', { ip: '10.0.0.41', headers: { Origin: 'https://locallink.store' } });
+  check('prices CORS allows locallink.store', corsP.headers.get('access-control-allow-origin') === 'https://locallink.store');
+  const corsPE = await req('GET', '/api/prices', { ip: '10.0.0.41', headers: { Origin: 'https://evil.example' } });
+  check('prices CORS denies other origins', corsPE.headers.get('access-control-allow-origin') === null);
+  const preP = await req('OPTIONS', '/api/prices', { ip: '10.0.0.41', headers: { Origin: 'https://locallink.store' } });
+  check('prices OPTIONS preflight 204', preP.status === 204 && (preP.headers.get('access-control-allow-methods') || '').includes('GET'));
+
+  const noAuthGet = await req('GET', '/api/admin/prices', { ip: '10.0.0.42' });
+  check('admin prices GET rejects unauthenticated', noAuthGet.status === 401);
+  const noAuthPost = await req('POST', '/api/admin/prices', { ip: '10.0.0.42', headers: { 'Content-Type': 'application/json' }, body: { id: 'logo', price: 15 } });
+  check('admin prices POST rejects unauthenticated', noAuthPost.status === 401);
+  const noAuthDel = await req('DELETE', '/api/admin/prices/logo', { ip: '10.0.0.42' });
+  check('admin prices DELETE rejects unauthenticated', noAuthDel.status === 401);
+
+  const list = await req('GET', '/api/admin/prices', { ip: '10.0.0.43', headers: auth });
+  const listData = await list.json();
+  check('admin prices GET 200 with 26 services', list.status === 200 && Array.isArray(listData.items) && listData.items.length === 26, 'n=' + (listData.items && listData.items.length));
+  check('admin prices excludes products', listData.items.every((i) => !i.id.startsWith('prod-')));
+  check('admin prices defaults + flags', listData.items.every((i) => i.price === i.defaultPrice && i.overridden === false && 'monthly' in i && 'editable' in i && 'group' in i));
+
+  const badId = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'nope', price: 15 } });
+  check('prices POST rejects unknown id', badId.status === 400);
+  const prodId = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'prod-nfc-stand', price: 55 } });
+  check('prices POST rejects product id', prodId.status === 400);
+  const neg = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo', price: -1 } });
+  check('prices POST rejects negative price', neg.status === 400);
+  const frac = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo', price: 15.5 } });
+  check('prices POST rejects fractional price', frac.status === 400);
+  const str = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo', price: '15' } });
+  check('prices POST rejects string price', str.status === 400);
+  const big = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo', price: 100000 } });
+  check('prices POST rejects price > 99999', big.status === 400);
+  const missing = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo' } });
+  check('prices POST rejects missing price', missing.status === 400);
+  const cross = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example', ...auth }, body: { id: 'logo', price: 15 } });
+  check('prices POST rejects cross-site Origin', cross.status === 403);
+
+  const ov = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo', price: 15 } });
+  const ovData = await ov.json();
+  check('prices POST override 200', ov.status === 200 && ovData.overridden === true && ovData.price === 15, JSON.stringify(ovData));
+  const pub1 = await req('GET', '/api/prices', { ip: '10.0.0.40' });
+  const pub1Data = await pub1.json();
+  check('public prices shows override only', pub1Data.prices.logo === 15 && Object.keys(pub1Data.prices).length === 1, JSON.stringify(pub1Data));
+  const cat1 = await req('GET', '/api/admin/catalog', { ip: '10.0.0.43', headers: auth });
+  const cat1Data = await cat1.json();
+  check('catalog uses effective price', cat1Data.items.find((i) => i.id === 'logo').price === 15);
+  const qEff = await req('POST', '/api/admin/quotes', { ip: '10.0.0.43', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'logo', qty: 2, price: 999 }] } });
+  const qEffData = await qEff.json();
+  check('quote charges effective fixed price', qEff.status === 200 && qEffData.total_once === 30, JSON.stringify(qEffData));
+
+  await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'site-build', price: 80 } });
+  const qEdit = await req('POST', '/api/admin/quotes', { ip: '10.0.0.43', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'site-build', qty: 1 }] } });
+  const qEditData = await qEdit.json();
+  check('quote uses effective price for from-item', qEdit.status === 200 && qEditData.total_once === 80, JSON.stringify(qEditData));
+  const qEditSent = await req('POST', '/api/admin/quotes', { ip: '10.0.0.43', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'site-build', qty: 1, price: 999 }] } });
+  const qEditSentData = await qEditSent.json();
+  check('quote ignores sent price on overridden from-item', qEditSent.status === 200 && qEditSentData.total_once === 80, JSON.stringify(qEditSentData));
+
+  const saveDef = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo', price: 10 } });
+  const saveDefData = await saveDef.json();
+  check('saving default removes override', saveDef.status === 200 && saveDefData.overridden === false, JSON.stringify(saveDefData));
+  const pub2 = await req('GET', '/api/prices', { ip: '10.0.0.40' });
+  const pub2Data = await pub2.json();
+  check('public prices drops removed override', !('logo' in pub2Data.prices) && pub2Data.prices['site-build'] === 80, JSON.stringify(pub2Data));
+
+  await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo', price: 20 } });
+  const del = await req('DELETE', '/api/admin/prices/logo', { ip: '10.0.0.43', headers: auth });
+  const delData = await del.json();
+  check('prices DELETE resets to default', del.status === 200 && delData.price === 10, JSON.stringify(delData));
+  const delAgain = await req('DELETE', '/api/admin/prices/logo', { ip: '10.0.0.43', headers: auth });
+  check('prices DELETE without override still 200', delAgain.status === 200);
+  const delBad = await req('DELETE', '/api/admin/prices/nope', { ip: '10.0.0.43', headers: auth });
+  check('prices DELETE rejects unknown id', delBad.status === 400);
+  const delProd = await req('DELETE', '/api/admin/prices/prod-nfc-stand', { ip: '10.0.0.43', headers: auth });
+  check('prices DELETE rejects product id', delProd.status === 400);
+  const delCross = await req('DELETE', '/api/admin/prices/logo', { ip: '10.0.0.43', headers: { Origin: 'https://evil.example', ...auth } });
+  check('prices DELETE rejects cross-site Origin', delCross.status === 403);
+
+  await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'gbp-all', price: 55 } });
+  const bMix = await req('POST', '/api/admin/quotes', { ip: '10.0.0.43', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'gbp-all', qty: 1 }, { id: 'gbp-create', qty: 1 }] } });
+  check('bundle rule still enforced with effective prices', bMix.status === 400);
+  const bOnly = await req('POST', '/api/admin/quotes', { ip: '10.0.0.43', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'gbp-all', qty: 1 }] } });
+  const bOnlyData = await bOnly.json();
+  check('bundle alone charges effective price', bOnly.status === 200 && bOnlyData.total_once === 55, JSON.stringify(bOnlyData));
+  await req('DELETE', '/api/admin/prices/gbp-all', { ip: '10.0.0.43', headers: auth });
+  await req('DELETE', '/api/admin/prices/site-build', { ip: '10.0.0.43', headers: auth });
+  const pubFinal = await req('GET', '/api/prices', { ip: '10.0.0.40' });
+  const pubFinalData = await pubFinal.json();
+  check('public prices empty after cleanup', Object.keys(pubFinalData.prices).length === 0, JSON.stringify(pubFinalData));
+
+  let last = 0;
+  for (let i = 0; i < 121; i++) {
+    const r = await req('GET', '/api/prices', { ip: '10.0.0.44' });
+    last = r.status;
+  }
+  check('public prices rate limit: 121st request 429', last === 429, 'last=' + last);
+
+  const page = await req('GET', '/admin');
+  const html = await page.text();
+  check('admin page has prices tab', html.includes('tab-btn-prices') && html.includes('ფასები') && html.includes('/api/admin/prices') && html.includes('price-rows'));
+  check('admin page delete button is solid red', html.includes('.btn-danger{background:#E5484D'));
+  check('calculator has no price inputs', !html.includes('data-price-for'));
 }
 
 // ---------- logout ----------

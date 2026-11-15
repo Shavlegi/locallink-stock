@@ -10,8 +10,9 @@
  *
  * The admin UI is ONE self-contained HTML page embedded below — no static
  * files, no external assets, so there is no static-file allowlist to keep
- * in sync. It has two tabs: stock management and the quote calculator
- * (client cards with chosen services/products and totals).
+ * in sync. It has three tabs: stock management, the quote calculator
+ * (client cards with chosen services/products and totals), and service
+ * price editing (overrides that the shop picks up via GET /api/prices).
  *
  * Stock semantics: a missing row, or a NULL value, means "unset" — the
  * shop shows no stock line for that product. stock = 0 means "out of
@@ -65,6 +66,11 @@ const CATALOG = [
   { id: 'prod-photo-stand', group: 'NFC პროდუქტები', name: 'სტენდი ჩასასმელი ფოტოთი', price: 60, monthly: false, editable: false },
 ];
 const CATALOG_MAP = new Map(CATALOG.map((c) => [c.id, c]));
+
+// Price overrides apply to SERVICES ONLY — never to NFC products
+// (prod-* ids keep their fixed catalog prices).
+const SERVICE_CATALOG = CATALOG.filter((c) => !c.id.startsWith('prod-'));
+const SERVICE_ID_SET = new Set(SERVICE_CATALOG.map((c) => c.id));
 
 const CONFIG = {
   sessionDays: 7,
@@ -298,6 +304,28 @@ async function ensureSchema(env) {
   } catch (e) {
     console.error('ensureSchema v3 error:', e && e.message ? e.message : e);
   }
+  // v4: price_overrides — admin-edited service prices. CATALOG holds the
+  // defaults; a row here wins. The shop fetches GET /api/prices.
+  try {
+    const flag4 = await env.STOCK_DB.prepare(
+      "SELECT value FROM schema_meta WHERE key = 'v4_price_overrides'",
+    ).first();
+    if (!flag4 || flag4.value !== '1') {
+      await env.STOCK_DB.batch([
+        env.STOCK_DB.prepare(
+          'CREATE TABLE IF NOT EXISTS price_overrides (' +
+          'id TEXT PRIMARY KEY, ' +
+          'price INTEGER NOT NULL, ' +
+          'updated_at INTEGER NOT NULL)',
+        ),
+        env.STOCK_DB.prepare(
+          "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('v4_price_overrides', '1')",
+        ),
+      ]);
+    }
+  } catch (e) {
+    console.error('ensureSchema v4 error:', e && e.message ? e.message : e);
+  }
   schemaChecked = true;
 }
 
@@ -421,7 +449,7 @@ async function logSecurityEvent(env, event, request) {
 }
 
 /* ------------------------------------------------------------------ */
-/* CORS (public stock API only)                                        */
+/* CORS (public stock + prices APIs)                                   */
 /* ------------------------------------------------------------------ */
 
 function corsHeaders(request) {
@@ -562,8 +590,9 @@ async function handleSecurityEvents(env, request) {
 async function handleCatalog(env, request) {
   const session = await requireSession(env, request);
   if (!session) return error('შესვლა საჭიროა.', 401);
+  const items = await effectiveCatalog(env);
   return json({
-    items: CATALOG.map((c) => ({
+    items: items.map((c) => ({
       id: c.id,
       group: c.group,
       name: c.name,
@@ -581,7 +610,8 @@ function cleanText(v, maxLen) {
 }
 
 // Validates a quote body and returns the snapshot items + totals, or null.
-function buildQuoteItems(bodyItems) {
+// catalogMap maps ids to catalog entries with EFFECTIVE prices.
+function buildQuoteItems(bodyItems, catalogMap) {
   if (!Array.isArray(bodyItems) || bodyItems.length < 1 || bodyItems.length > 50) return null;
   const seen = new Set();
   const items = [];
@@ -589,24 +619,14 @@ function buildQuoteItems(bodyItems) {
   let totalMonthly = 0;
   for (const raw of bodyItems) {
     if (!raw || typeof raw !== 'object') return null;
-    const entry = CATALOG_MAP.get(raw.id);
+    const entry = catalogMap.get(raw.id);
     if (!entry || seen.has(raw.id)) return null;
     seen.add(raw.id);
     const qty = raw.qty;
     if (typeof qty !== 'number' || !Number.isInteger(qty) || qty < 1 || qty > 99) return null;
-    let price;
-    if (entry.editable) {
-      // Editable ("from") price: the admin types the agreed amount.
-      if (raw.price === null || raw.price === undefined) {
-        price = entry.price;
-      } else {
-        if (typeof raw.price !== 'number' || !Number.isInteger(raw.price) || raw.price < 0 || raw.price > CONFIG.maxQty) return null;
-        price = raw.price;
-      }
-    } else {
-      // Fixed price: always the catalog value, whatever the client sent.
-      price = entry.price;
-    }
+    // Always the EFFECTIVE catalog price — client-sent prices are ignored
+    // completely. Price editing lives ONLY in the Prices tab.
+    const price = entry.price;
     items.push({ id: entry.id, name: entry.name, qty, price, monthly: entry.monthly });
     if (entry.monthly) totalMonthly += price * qty;
     else totalOnce += price * qty;
@@ -661,7 +681,9 @@ async function handleQuotesPost(env, request) {
   const lastName = cleanText(body && body.last_name, 100);
   const phone = cleanText(body && body.phone, 50);
   const note = typeof body.note === 'string' ? body.note.trim().slice(0, 1000) : '';
-  const built = buildQuoteItems(body && body.items);
+  const effective = await effectiveCatalog(env);
+  const effMap = new Map(effective.map((c) => [c.id, c]));
+  const built = buildQuoteItems(body && body.items, effMap);
   if (!built) return error('აირჩიეთ მინიმუმ ერთი პუნქტი სწორი რაოდენობითა და ფასით.', 400);
   const res = await env.STOCK_DB.prepare(
     'INSERT INTO quotes (first_name, last_name, phone, note, items, total_once, total_monthly, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
@@ -678,6 +700,97 @@ async function handleQuoteDelete(env, request, id) {
   const changes = res && res.meta ? res.meta.changes : 0;
   if (!changes) return error('ბარათი ვერ მოიძებნა.', 404);
   return json({ ok: true, id });
+}
+
+/* ------------------------------------------------------------------ */
+/* Price overrides (admin-editable service prices)                     */
+/* CATALOG holds the defaults; an override row wins. The shop fetches  */
+/* GET /api/prices and merges overrides over its built-in prices.      */
+/* ------------------------------------------------------------------ */
+
+async function loadOverrides(env) {
+  const { results } = await env.STOCK_DB.prepare('SELECT id, price FROM price_overrides').all();
+  const map = new Map();
+  for (const row of results || []) {
+    if (SERVICE_ID_SET.has(row.id) && Number.isInteger(row.price)) map.set(row.id, row.price);
+  }
+  return map;
+}
+
+async function effectiveCatalog(env) {
+  const overrides = await loadOverrides(env);
+  return CATALOG.map((c) => ({
+    id: c.id,
+    group: c.group,
+    name: c.name,
+    price: overrides.has(c.id) ? overrides.get(c.id) : c.price,
+    monthly: c.monthly,
+    editable: c.editable,
+  }));
+}
+
+async function handlePublicPrices(env, request) {
+  const allowed = await checkRateLimit(request, env, 'prices', CONFIG.stockLimitPerMin, 60);
+  if (!allowed) return error('ძალიან ბევრი მოთხოვნა — ცოტა ხანში სცადეთ.', 429, corsHeaders(request));
+  const overrides = await loadOverrides(env);
+  const out = {};
+  for (const [id, price] of overrides) out[id] = price;
+  return json({ prices: out }, 200, corsHeaders(request));
+}
+
+async function handleAdminPricesGet(env, request) {
+  const session = await requireSession(env, request);
+  if (!session) return error('შესვლა საჭიროა.', 401);
+  const overrides = await loadOverrides(env);
+  return json({
+    items: SERVICE_CATALOG.map((c) => ({
+      id: c.id,
+      group: c.group,
+      name: c.name,
+      price: overrides.has(c.id) ? overrides.get(c.id) : c.price,
+      defaultPrice: c.price,
+      monthly: c.monthly,
+      editable: c.editable,
+      overridden: overrides.has(c.id),
+    })),
+  });
+}
+
+async function handleAdminPricesPost(env, request) {
+  if (!originAllowed(request)) return error('არასწორი წყარო (Origin).', 403);
+  const session = await requireSession(env, request);
+  if (!session) return error('შესვლა საჭიროა.', 401);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return error('არასწორი მონაცემები.', 400);
+  }
+  const id = body && body.id;
+  if (typeof id !== 'string' || !SERVICE_ID_SET.has(id)) return error('არასწორი სერვისი.', 400);
+  const price = body && body.price;
+  if (typeof price !== 'number' || !Number.isInteger(price) || price < 0 || price > CONFIG.maxQty) {
+    return error('ფასი უნდა იყოს მთელი რიცხვი 0–99999.', 400);
+  }
+  const entry = CATALOG_MAP.get(id);
+  if (price === entry.price) {
+    // Saving the default removes the override.
+    await env.STOCK_DB.prepare('DELETE FROM price_overrides WHERE id = ?').bind(id).run();
+    return json({ ok: true, id, price, overridden: false });
+  }
+  await env.STOCK_DB.prepare(
+    'INSERT INTO price_overrides (id, price, updated_at) VALUES (?, ?, ?) ' +
+    'ON CONFLICT(id) DO UPDATE SET price = excluded.price, updated_at = excluded.updated_at',
+  ).bind(id, price, Date.now()).run();
+  return json({ ok: true, id, price, overridden: true });
+}
+
+async function handlePriceDelete(env, request, id) {
+  if (!originAllowed(request)) return error('არასწორი წყარო (Origin).', 403);
+  const session = await requireSession(env, request);
+  if (!session) return error('შესვლა საჭიროა.', 401);
+  await env.STOCK_DB.prepare('DELETE FROM price_overrides WHERE id = ?').bind(id).run();
+  return json({ ok: true, id, price: CATALOG_MAP.get(id).price });
 }
 
 /* ------------------------------------------------------------------ */
@@ -776,7 +889,19 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
 .quote-items li:first-child{border-top:0}
 .quote-total{font-weight:700;font-size:15px;margin-bottom:12px}
 .quote-date{color:var(--muted);font-size:12px;white-space:nowrap}
-.btn-danger{background:transparent;border-color:rgba(255,107,107,.5);color:#ff8a8a}
+.btn-danger{background:#E5484D;border-color:#E5484D;color:#fff}
+.price-group{margin-bottom:18px}
+.price-group h3{font-size:13px;margin:0 0 4px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.price-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--border)}
+.price-row:first-of-type{border-top:0}
+.price-row .nm{font-size:15px}
+.price-row .nm small{display:block;color:var(--muted);font-size:12px}
+.price-row .changed{color:#f5c86b;font-weight:600}
+.price-ctl{display:flex;gap:6px;align-items:center}
+.price-ctl input[type=number]{width:72px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 6px;font-size:15px;text-align:center;-moz-appearance:textfield}
+.price-ctl input[type=number]::-webkit-outer-spin-button,.price-ctl input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.btn-sm{padding:8px 14px;font-size:14px}
+.btn-reset{background:transparent;border-color:rgba(255,255,255,.25);color:var(--muted)}
 </style>
 </head>
 <body>
@@ -798,6 +923,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     <div class="tabs">
       <button class="tab active" id="tab-btn-stock" type="button">მარაგი</button>
       <button class="tab" id="tab-btn-calc" type="button">კალკულატორი</button>
+      <button class="tab" id="tab-btn-prices" type="button">ფასები</button>
     </div>
     <div id="tab-stock">
       <p class="sub">ცარიელი ველი = რაოდენობა არ ჩანს მაღაზიაში.</p>
@@ -823,6 +949,11 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
         <button class="btn btn-block" id="calc-save" type="button">ბარათის შენახვა</button>
       </div>
       <div id="quote-list"></div>
+    </div>
+    <div id="tab-prices" hidden>
+      <p class="sub">ფასის შეცვლა მაშინვე აისახება საიტზე და კალკულატორში.</p>
+      <div class="err" id="prices-err" hidden></div>
+      <div id="price-rows"><p class="sub">იტვირთება…</p></div>
     </div>
   </div>
 </div>
@@ -957,18 +1088,24 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
   }
 
   function switchTab(which) {
-    var stockBtn = document.getElementById('tab-btn-stock');
-    var calcBtn = document.getElementById('tab-btn-calc');
-    var stockTab = document.getElementById('tab-stock');
-    var calcTab = document.getElementById('tab-calc');
-    if (which === 'calc') {
-      stockBtn.classList.remove('active'); calcBtn.classList.add('active');
-      stockTab.hidden = true; calcTab.hidden = false;
-      loadCatalog(); loadQuotes();
-    } else {
-      calcBtn.classList.remove('active'); stockBtn.classList.add('active');
-      calcTab.hidden = true; stockTab.hidden = false;
+    var btns = {
+      stock: document.getElementById('tab-btn-stock'),
+      calc: document.getElementById('tab-btn-calc'),
+      prices: document.getElementById('tab-btn-prices')
+    };
+    var tabs = {
+      stock: document.getElementById('tab-stock'),
+      calc: document.getElementById('tab-calc'),
+      prices: document.getElementById('tab-prices')
+    };
+    var keys = ['stock', 'calc', 'prices'];
+    for (var i = 0; i < keys.length; i++) {
+      var on = keys[i] === which;
+      if (on) btns[keys[i]].classList.add('active'); else btns[keys[i]].classList.remove('active');
+      tabs[keys[i]].hidden = !on;
     }
+    if (which === 'calc') { loadCatalog(); loadQuotes(); }
+    if (which === 'prices') { loadPrices(); }
   }
 
   function loadCatalog() {
@@ -1000,12 +1137,8 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
       var items = byGroup[groups[gi]];
       for (var ii = 0; ii < items.length; ii++) {
         var item = items[ii];
-        var priceHtml;
-        if (item.editable) {
-          priceHtml = '<input class="price-input" type="number" inputmode="numeric" min="0" max="99999" value="' + item.price + '" data-price-for="' + item.id + '" aria-label="ფასი"><span class="pr">₾</span>';
-        } else {
-          priceHtml = '<span class="pr">' + item.price + '₾' + (item.monthly ? '/თვე' : '') + '</span>';
-        }
+        // Static price text only — price editing lives in the Prices tab.
+        var priceHtml = '<span class="pr">' + item.price + '₾' + (item.monthly ? '/თვე' : (item.editable ? '-დან' : '')) + '</span>';
         out += '<div class="calc-item" data-item="' + item.id + '">' +
           '<input type="checkbox" data-check="' + item.id + '" aria-label="' + escHtml(item.name) + '">' +
           '<span class="nm">' + escHtml(item.name) + '</span>' +
@@ -1029,13 +1162,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
       var qty = parseInt(qtyEl ? qtyEl.value : '1', 10);
       if (isNaN(qty) || qty < 1) qty = 1;
       if (qty > 99) qty = 99;
-      var price = item.price;
-      if (item.editable) {
-        var pEl = document.querySelector('[data-price-for="' + item.id + '"]');
-        var p = parseInt(pEl ? pEl.value : '', 10);
-        if (!isNaN(p) && p >= 0 && p <= 99999) price = p;
-      }
-      out.push({ id: item.id, qty: qty, price: price });
+      out.push({ id: item.id, qty: qty });
     }
     return out;
   }
@@ -1048,8 +1175,8 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     for (var j = 0; j < sel.length; j++) {
       var entry = map[sel[j].id];
       if (!entry) continue;
-      if (entry.monthly) monthly += sel[j].price * sel[j].qty;
-      else once += sel[j].price * sel[j].qty;
+      if (entry.monthly) monthly += entry.price * sel[j].qty;
+      else once += entry.price * sel[j].qty;
     }
     document.getElementById('total-once').textContent = once + '₾';
     document.getElementById('total-monthly').textContent = monthly + '₾/თვე';
@@ -1200,6 +1327,124 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     }).catch(function () {});
   });
 
+  /* Prices tab: edit service prices; the shop picks them up via /api/prices. */
+
+  var pricesLoaded = false;
+
+  function loadPrices() {
+    if (pricesLoaded) return;
+    fetch('/api/admin/prices').then(function (res) {
+      if (!res.ok) throw new Error('prices');
+      return res.json();
+    }).then(function (data) {
+      pricesLoaded = true;
+      renderPrices((data && data.items) || []);
+    }).catch(function () {
+      document.getElementById('price-rows').innerHTML = '<p class="sub">ვერ ჩაიტვირთა.</p>';
+    });
+  }
+
+  function priceRowHint(row) {
+    if (row.getAttribute('data-monthly') === '1') return '₾/თვე';
+    if (row.getAttribute('data-editable') === '1') return '₾-დან';
+    return '₾';
+  }
+
+  function refreshPriceRow(row, overridden) {
+    var def = row.getAttribute('data-default');
+    var small = row.querySelector('.nm small');
+    small.innerHTML = priceRowHint(row) + (overridden ? ' · <span class="changed">შეცვლილი (ნაგულისხმევი: ' + def + '₾)</span>' : '');
+    row.querySelector('[data-price-reset]').hidden = !overridden;
+  }
+
+  function renderPrices(items) {
+    var box = document.getElementById('price-rows');
+    var groups = [];
+    var byGroup = {};
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (!byGroup[it.group]) { byGroup[it.group] = []; groups.push(it.group); }
+      byGroup[it.group].push(it);
+    }
+    var out = '';
+    for (var gi = 0; gi < groups.length; gi++) {
+      out += '<div class="price-group"><h3>' + escHtml(groups[gi]) + '</h3>';
+      var rows = byGroup[groups[gi]];
+      for (var ri = 0; ri < rows.length; ri++) {
+        var item = rows[ri];
+        var hint = item.monthly ? '₾/თვე' : (item.editable ? '₾-დან' : '₾');
+        out += '<div class="price-row" data-price-row="' + item.id + '" data-default="' + item.defaultPrice + '" data-monthly="' + (item.monthly ? '1' : '0') + '" data-editable="' + (item.editable ? '1' : '0') + '">' +
+          '<span class="nm">' + escHtml(item.name) +
+            '<small>' + hint + (item.overridden ? ' · <span class="changed">შეცვლილი (ნაგულისხმევი: ' + item.defaultPrice + '₾)</span>' : '') + '</small></span>' +
+          '<span class="price-ctl">' +
+            '<input type="number" inputmode="numeric" min="0" max="99999" value="' + item.price + '" data-price-input aria-label="ფასი">' +
+            '<button class="btn btn-sm" type="button" data-price-save>შენახვა</button>' +
+            '<button class="btn btn-sm btn-reset" type="button" data-price-reset aria-label="ნაგულისხმევზე დაბრუნება"' + (item.overridden ? '' : ' hidden') + '>↺</button>' +
+            '<span class="saved" hidden>შენახულია ✓</span>' +
+          '</span>' +
+        '</div>';
+      }
+      out += '</div>';
+    }
+    box.innerHTML = out;
+  }
+
+  document.getElementById('tab-btn-prices').addEventListener('click', function () { switchTab('prices'); });
+
+  document.getElementById('price-rows').addEventListener('click', function (e) {
+    var saveBtn = e.target.closest ? e.target.closest('[data-price-save]') : null;
+    var resetBtn = e.target.closest ? e.target.closest('[data-price-reset]') : null;
+    if (!saveBtn && !resetBtn) return;
+    var row = (saveBtn || resetBtn).closest('[data-price-row]');
+    var id = row.getAttribute('data-price-row');
+    var errBox = document.getElementById('prices-err');
+    errBox.hidden = true;
+    if (saveBtn) {
+      var val = row.querySelector('[data-price-input]').value.trim();
+      var price = val === '' ? NaN : parseInt(val, 10);
+      if (isNaN(price) || price < 0 || price > 99999) {
+        errBox.textContent = 'ფასი უნდა იყოს მთელი რიცხვი 0–99999.';
+        errBox.hidden = false;
+        return;
+      }
+      saveBtn.disabled = true;
+      fetch('/api/admin/prices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: id, price: price })
+      }).then(function (res) {
+        saveBtn.disabled = false;
+        if (!res.ok) throw new Error('save');
+        return res.json();
+      }).then(function (data) {
+        refreshPriceRow(row, !!(data && data.overridden));
+        catalogLoaded = false;
+        var saved = row.querySelector('.saved');
+        saved.hidden = false;
+        setTimeout(function () { saved.hidden = true; }, 2000);
+      }).catch(function () {
+        saveBtn.disabled = false;
+        errBox.textContent = 'ვერ შეინახა. სცადეთ თავიდან.';
+        errBox.hidden = false;
+      });
+    } else {
+      resetBtn.disabled = true;
+      fetch('/api/admin/prices/' + id, { method: 'DELETE' }).then(function (res) {
+        resetBtn.disabled = false;
+        if (!res.ok) throw new Error('reset');
+        return res.json();
+      }).then(function (data) {
+        row.querySelector('[data-price-input]').value = String(data.price);
+        refreshPriceRow(row, false);
+        catalogLoaded = false;
+      }).catch(function () {
+        resetBtn.disabled = false;
+        errBox.textContent = 'ვერ დაბრუნდა ნაგულისხმევზე. სცადეთ თავიდან.';
+        errBox.hidden = false;
+      });
+    }
+  });
+
   checkSession();
 })();
 </script>
@@ -1260,6 +1505,22 @@ export default {
       return handlePublicStock(env, request);
     }
 
+    if (path === '/api/prices' && request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          ...corsHeaders(request),
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+          'Access-Control-Max-Age': '86400',
+          ...SECURITY_HEADERS,
+        },
+      });
+    }
+    if (path === '/api/prices' && request.method === 'GET') {
+      return handlePublicPrices(env, request);
+    }
+
     if (path === '/api/admin/login' && request.method === 'POST') {
       return handleLogin(env, request);
     }
@@ -1293,6 +1554,19 @@ export default {
         return error('არასწორი ბარათი.', 400);
       }
       return handleQuoteDelete(env, request, id);
+    }
+    if (path === '/api/admin/prices' && request.method === 'GET') {
+      return handleAdminPricesGet(env, request);
+    }
+    if (path === '/api/admin/prices' && request.method === 'POST') {
+      return handleAdminPricesPost(env, request);
+    }
+    if (path.startsWith('/api/admin/prices/') && request.method === 'DELETE') {
+      const id = path.slice('/api/admin/prices/'.length);
+      if (!SERVICE_ID_SET.has(id)) {
+        return error('არასწორი სერვისი.', 400);
+      }
+      return handlePriceDelete(env, request, id);
     }
 
     return error('ვერ მოიძებნა.', 404);
