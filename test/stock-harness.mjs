@@ -597,7 +597,37 @@ let cookie = null;
   const page = await req('GET', '/admin');
   const html = await page.text();
   check('admin page has sale price inputs + live pct labels', html.includes('data-sale-input') && html.includes('data-sale-pct') && html.includes('refreshSalePct'));
-  check('calculator shows struck base + discount label', html.includes('class="disc"') && html.includes('<s>'));
+  check('calculator shows struck base + colored discount label', html.includes('class="disc ') && html.includes('discClassFor(pct)') && html.includes('<s>'));
+}
+
+// ---------- discount badge colors (red <=20%, yellow 21-50%, green >50%) ----------
+{
+  const page = await req('GET', '/admin');
+  const html = await page.text();
+  // Execute the real mapping from the served page (no DOM deps).
+  const fnSrc = (html.match(/function discClassFor\(pct\) \{[\s\S]*?\n  \}/) || [])[0];
+  check('admin page defines discClassFor', typeof fnSrc === 'string', fnSrc ? '' : 'not found');
+  const discClassFor = new Function(fnSrc + '\nreturn discClassFor;')();
+  const bands = [[1, 'disc-red'], [20, 'disc-red'], [21, 'disc-yellow'], [33, 'disc-yellow'], [40, 'disc-yellow'], [50, 'disc-yellow'], [51, 'disc-green'], [75, 'disc-green'], [100, 'disc-green']];
+  for (const [pct, cls] of bands) {
+    check('discClassFor(' + pct + '%) = ' + cls, discClassFor(pct) === cls, discClassFor(pct));
+  }
+  check('admin CSS: red pill #E5484D + white text', html.includes('.sale-pct.disc-red{background:#E5484D;color:#fff}'));
+  check('admin CSS: yellow pill #F5C518 + dark text', html.includes('.sale-pct.disc-yellow{background:#F5C518;color:#1A1A1A}'));
+  check('admin CSS: green pill #22C55E + white text', html.includes('.sale-pct.disc-green{background:#22C55E;color:#fff}'));
+  check('admin CSS: color classes cover calculator labels too', html.includes('.calc-ctl .disc.disc-red') && html.includes('.calc-ctl .disc.disc-yellow') && html.includes('.calc-ctl .disc.disc-green'));
+  check('refreshSalePct assigns color class live', html.includes("pctEl.className = 'sale-pct ' + discClassFor(pct)"));
+  check('refreshSalePct clears color class when hidden', html.includes("pctEl.className = 'sale-pct';"));
+  check('Prices tab initial label carries color class', html.includes("pctCls") && html.includes("' ' + discClassFor(item.discountPct)"));
+  check('calculator discount label uses discClassFor', html.includes("class=\"disc ' + discClassFor(pct) + '\""));
+  // The inline <script> lives inside a JS template literal: no backticks/${}.
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  const scriptStart = src.indexOf('\n<script>\n');
+  const scriptEnd = src.indexOf('</script>', scriptStart);
+  const inline = src.slice(scriptStart, scriptEnd);
+  check('inline script has no backticks', !inline.includes('`'));
+  check('inline script has no ${} interpolations', !inline.includes('${'));
 }
 
 // ---------- logout ----------

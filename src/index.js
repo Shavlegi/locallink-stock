@@ -1002,6 +1002,10 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
 .sale-label{font-size:12px;color:var(--muted);white-space:nowrap}
 .sale-pct{color:#f5c86b;font-weight:700;white-space:nowrap;font-size:14px;min-width:46px;text-align:right}
 .sale-pct[hidden]{display:none}
+.disc-red,.disc-yellow,.disc-green{display:inline-block;padding:2px 7px;border-radius:999px}
+.calc-ctl .disc.disc-red,.sale-pct.disc-red{background:#E5484D;color:#fff}
+.calc-ctl .disc.disc-yellow,.sale-pct.disc-yellow{background:#F5C518;color:#1A1A1A}
+.calc-ctl .disc.disc-green,.sale-pct.disc-green{background:#22C55E;color:#fff}
 .price-ctl input[type=number]::-webkit-outer-spin-button,.price-ctl input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
 .btn-sm{padding:8px 14px;font-size:14px}
 .btn-reset{background:transparent;border-color:rgba(255,255,255,.25);color:var(--muted)}
@@ -1249,7 +1253,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
         if (hasDisc) {
           var pct = item.discountPct;
           if (pct === null || pct === undefined) pct = Math.round((item.price - item.salePrice) / item.price * 100);
-          priceHtml = '<span class="pr"><s>' + item.price + '₾' + suffix + '</s> ' + item.salePrice + '₾' + suffix + ' <span class="disc">−' + pct + '%</span></span>';
+          priceHtml = '<span class="pr"><s>' + item.price + '₾' + suffix + '</s> ' + item.salePrice + '₾' + suffix + ' <span class="disc ' + discClassFor(pct) + '">−' + pct + '%</span></span>';
         } else {
           priceHtml = '<span class="pr">' + item.price + '₾' + suffix + '</span>';
         }
@@ -1474,6 +1478,15 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     row.querySelector('[data-price-reset]').hidden = !(overridden || hasDiscount);
   }
 
+  // Discount % label color: red up to 20%, yellow 21–50%, green above
+  // 50%. Same bands as the shop site; used by the calculator and the
+  // Prices tab.
+  function discClassFor(pct) {
+    if (pct <= 20) return 'disc-red';
+    if (pct <= 50) return 'disc-yellow';
+    return 'disc-green';
+  }
+
   // Live discount % from the row's current price and sale-price fields.
   // Hidden when the sale field is empty, invalid, or not below the price.
   function refreshSalePct(row) {
@@ -1485,9 +1498,12 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     if (isNaN(price) || isNaN(sale) || price <= 0 || sale < 0 || sale >= price) {
       pctEl.hidden = true;
       pctEl.textContent = '';
+      pctEl.className = 'sale-pct';
       return;
     }
-    pctEl.textContent = '−' + Math.round((price - sale) / price * 100) + '%';
+    var pct = Math.round((price - sale) / price * 100);
+    pctEl.textContent = '−' + pct + '%';
+    pctEl.className = 'sale-pct ' + discClassFor(pct);
     pctEl.hidden = false;
   }
 
@@ -1511,6 +1527,9 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
         var pctHtml = (hasDisc && item.discountPct !== null && item.discountPct !== undefined)
           ? '−' + item.discountPct + '%'
           : '';
+        var pctCls = (hasDisc && item.discountPct !== null && item.discountPct !== undefined)
+          ? ' ' + discClassFor(item.discountPct)
+          : '';
         out += '<div class="price-row" data-price-row="' + item.id + '" data-default="' + item.defaultPrice + '" data-monthly="' + (item.monthly ? '1' : '0') + '" data-editable="' + (item.editable ? '1' : '0') + '">' +
           '<span class="nm">' + escHtml(item.name) +
             '<small>' + hint + (item.overridden ? ' · <span class="changed">შეცვლილი (ნაგულისხმევი: ' + item.defaultPrice + '₾)</span>' : '') + '</small></span>' +
@@ -1524,7 +1543,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
             '<span class="price-ctl-row">' +
               '<span class="sale-label">ფასდაკლება ₾</span>' +
               '<input type="number" inputmode="numeric" min="0" max="99999" placeholder="—" value="' + (hasDisc ? item.salePrice : '') + '" data-sale-input aria-label="ფასდაკლების ფასი">' +
-              '<span class="sale-pct" data-sale-pct' + (pctHtml ? '' : ' hidden') + '>' + pctHtml + '</span>' +
+              '<span class="sale-pct' + pctCls + '" data-sale-pct' + (pctHtml ? '' : ' hidden') + '>' + pctHtml + '</span>' +
             '</span>' +
           '</span>' +
         '</div>';
