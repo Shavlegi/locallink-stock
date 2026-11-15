@@ -1,0 +1,33 @@
+# wrangler.toml — locallink-stock (Cloudflare Worker + D1)
+# Stock backend + admin panel for the locallink shop (https://locallink.store/).
+# Same proven pattern as Mini Link: Worker + D1, PBKDF2 admin password,
+# DB-backed sessions, IP-hash rate limiting (raw IPs are never stored).
+#
+# SETUP (dashboard, no terminal needed):
+# 1. Cloudflare dashboard -> Workers & Pages -> D1 (Storage) -> Create a
+#    database named "locallink-stock-db". Copy its database_id and paste it
+#    below, replacing REPLACE_WITH_YOUR_D1_DATABASE_ID.
+# 2. Workers & Pages -> Create -> Connect to Git -> connect this repo.
+#    The Worker name below ("locallink-stock") becomes
+#    locallink-stock.<account>.workers.dev.
+# 3. In the Worker -> Settings -> Variables and Secrets, add:
+#      ADMIN_PASSWORD_HASH — generate with
+#        ~/workspace/url-shortener/scripts/make-hash.html (opens in a browser;
+#        never commit or share the value)
+#      SESSION_SECRET — a long random string
+#    Never commit real secret values to the repo.
+# 4. Deploy. The Worker creates its D1 tables itself on the first request
+#    (lazy idempotent schema) — no migrations to run.
+# 5. Admin panel: https://locallink-stock.<account>.workers.dev/admin
+#    Public stock API: .../api/stock (read by the shop frontend).
+
+name = "locallink-stock"
+main = "src/index.js"
+compatibility_date = "2025-11-01"
+
+# D1 database binding. `binding` must stay "STOCK_DB" — the Worker code
+# reads env.STOCK_DB.
+[[d1_databases]]
+binding = "STOCK_DB"
+database_name = "locallink-stock-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
