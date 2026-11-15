@@ -70,3 +70,8 @@ node test/stock-harness.mjs
 ფორმა + CORS, ლოგინის უარყოფა, არაავტორიზებულის უარყოფა, upsert-ის
 ვალიდაცია, rate limit-ები, logout. ტესტის პაროლი/საიდუმლო მხოლოდ
 ტესტისთვისაა და არ გამოიყენება production-ში.
+
+## სტატუსი
+
+- 2026-11-15: Worker გაშვებულია (`locallink-stock.shao42ia.workers.dev`),
+  D1 `locallink-stock-db` დაკავშირებულია, secrets დაყენებულია.
