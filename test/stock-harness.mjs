@@ -490,6 +490,116 @@ let cookie = null;
   check('calculator has no price inputs', !html.includes('data-price-for'));
 }
 
+// ---------- discounts: sale prices + computed % ----------
+{
+  const auth = { Cookie: cookie };
+  const jsonHeaders = { 'Content-Type': 'application/json', ...auth };
+
+  const eqSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 10, sale_price: 10 } });
+  check('discount rejects sale == price', eqSale.status === 400);
+  const gtSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 10, sale_price: 11 } });
+  check('discount rejects sale > price', gtSale.status === 400);
+  const zeroBase = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 0, sale_price: 0 } });
+  check('discount rejects sale on price 0', zeroBase.status === 400);
+  const negSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 10, sale_price: -1 } });
+  check('discount rejects negative sale price', negSale.status === 400);
+  const fracSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 10, sale_price: 7.5 } });
+  check('discount rejects fractional sale price', fracSale.status === 400);
+  const strSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 10, sale_price: '7' } });
+  check('discount rejects string sale price', strSale.status === 400);
+  const bigSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 10, sale_price: 100000 } });
+  check('discount rejects sale price > 99999', bigSale.status === 400);
+  const unknownSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'nope', price: 10, sale_price: 7 } });
+  check('discount rejects unknown id', unknownSale.status === 400);
+  const prodSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'prod-nfc-stand', price: 50, sale_price: 40 } });
+  check('discount rejects product id', prodSale.status === 400);
+  const noAuthSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: { 'Content-Type': 'application/json' }, body: { id: 'logo', price: 10, sale_price: 7 } });
+  check('discount POST rejects unauthenticated', noAuthSale.status === 401);
+  const crossSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example', ...auth }, body: { id: 'logo', price: 10, sale_price: 7 } });
+  check('discount POST rejects cross-site Origin', crossSale.status === 403);
+
+  // % is computed from base + sale (whole percent, rounded).
+  const d1 = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'site-build', price: 50, sale_price: 36 } });
+  const d1Data = await d1.json();
+  check('50→36 computes 28%', d1.status === 200 && d1Data.salePrice === 36 && d1Data.discountPct === 28 && d1Data.overridden === false, JSON.stringify(d1Data));
+  const d2 = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 30, sale_price: 25 } });
+  const d2Data = await d2.json();
+  check('30→25 computes 17%', d2.status === 200 && d2Data.salePrice === 25 && d2Data.discountPct === 17 && d2Data.overridden === true, JSON.stringify(d2Data));
+  const d3 = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'gbp-all', price: 50, sale_price: 25 } });
+  const d3Data = await d3.json();
+  check('50→25 computes 50%', d3.status === 200 && d3Data.salePrice === 25 && d3Data.discountPct === 50, JSON.stringify(d3Data));
+
+  const list = await req('GET', '/api/admin/prices', { ip: '10.0.0.50', headers: auth });
+  const listData = await list.json();
+  const byIdP = {};
+  for (const it of listData.items) byIdP[it.id] = it;
+  check('admin prices list carries sale fields', byIdP['site-build'].salePrice === 36 && byIdP['site-build'].discountPct === 28 && byIdP['logo'].salePrice === 25 && byIdP['logo'].discountPct === 17);
+  check('undiscounted item has null sale fields', byIdP['banner'].salePrice === null && byIdP['banner'].discountPct === null);
+
+  const cat = await req('GET', '/api/admin/catalog', { ip: '10.0.0.50', headers: auth });
+  const catData = await cat.json();
+  const byIdC = {};
+  for (const it of catData.items) byIdC[it.id] = it;
+  check('catalog carries sale fields', byIdC['site-build'].price === 50 && byIdC['site-build'].salePrice === 36 && byIdC['site-build'].discountPct === 28 && byIdC['logo'].price === 30 && byIdC['logo'].salePrice === 25);
+
+  const pub = await req('GET', '/api/prices', { ip: '10.0.0.51' });
+  const pubData = await pub.json();
+  check('public prices returns discounts map', pubData.discounts && pubData.discounts['site-build'] === 36 && pubData.discounts['logo'] === 25 && pubData.discounts['gbp-all'] === 25, JSON.stringify(pubData));
+  check('public prices map keeps overrides only', pubData.prices.logo === 30 && !('site-build' in pubData.prices) && !('gbp-all' in pubData.prices), JSON.stringify(pubData.prices));
+  const corsD = await req('GET', '/api/prices', { ip: '10.0.0.51', headers: { Origin: 'https://locallink.store' } });
+  check('prices CORS still allows store with discounts', corsD.headers.get('access-control-allow-origin') === 'https://locallink.store');
+
+  const q = await req('POST', '/api/admin/quotes', { ip: '10.0.0.50', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'logo', qty: 2 }] } });
+  const qData = await q.json();
+  check('quote charges sale price', q.status === 200 && qData.total_once === 50, JSON.stringify(qData));
+  const q2 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.50', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'site-build', qty: 1 }] } });
+  const q2Data = await q2.json();
+  check('quote charges sale price on from-item', q2.status === 200 && q2Data.total_once === 36, JSON.stringify(q2Data));
+  const qList = await req('GET', '/api/admin/quotes', { ip: '10.0.0.50', headers: auth });
+  const qListData = await qList.json();
+  check('quote snapshot keeps sale price', qListData.quotes[0].items[0].id === 'site-build' && qListData.quotes[0].items[0].price === 36);
+
+  const bMix = await req('POST', '/api/admin/quotes', { ip: '10.0.0.50', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'gbp-all', qty: 1 }, { id: 'gbp-create', qty: 1 }] } });
+  check('bundle rule still enforced with discount', bMix.status === 400);
+  const bOnly = await req('POST', '/api/admin/quotes', { ip: '10.0.0.50', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'gbp-all', qty: 1 }] } });
+  const bOnlyData = await bOnly.json();
+  check('discounted bundle alone charges sale price', bOnly.status === 200 && bOnlyData.total_once === 25, JSON.stringify(bOnlyData));
+
+  const clr = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 30, sale_price: null } });
+  const clrData = await clr.json();
+  check('null sale_price clears discount, keeps override', clr.status === 200 && clrData.salePrice === null && clrData.discountPct === null && clrData.overridden === true, JSON.stringify(clrData));
+  const pubClr = await req('GET', '/api/prices', { ip: '10.0.0.51' });
+  const pubClrData = await pubClr.json();
+  check('public maps after clear: override stays, discount gone', pubClrData.prices.logo === 30 && !('logo' in pubClrData.discounts), JSON.stringify(pubClrData));
+  await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 30, sale_price: 20 } });
+  const omit = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 30 } });
+  const omitData = await omit.json();
+  check('omitted sale_price clears discount', omit.status === 200 && omitData.salePrice === null && omitData.discountPct === null, JSON.stringify(omitData));
+
+  await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'logo', price: 30, sale_price: 25 } });
+  const del = await req('DELETE', '/api/admin/prices/logo', { ip: '10.0.0.50', headers: auth });
+  const delData = await del.json();
+  check('DELETE resets override + discount', del.status === 200 && delData.price === 10 && delData.salePrice === null && delData.discountPct === null, JSON.stringify(delData));
+  const pubDel = await req('GET', '/api/prices', { ip: '10.0.0.51' });
+  const pubDelData = await pubDel.json();
+  check('public maps drop reset service', !('logo' in pubDelData.prices) && !('logo' in pubDelData.discounts), JSON.stringify(pubDelData));
+  const catDel = await req('GET', '/api/admin/catalog', { ip: '10.0.0.50', headers: auth });
+  const catDelData = await catDel.json();
+  const logoAfter = catDelData.items.find((i) => i.id === 'logo');
+  check('catalog back to default after DELETE', logoAfter.price === 10 && logoAfter.salePrice === null && logoAfter.discountPct === null);
+
+  await req('DELETE', '/api/admin/prices/site-build', { ip: '10.0.0.50', headers: auth });
+  await req('DELETE', '/api/admin/prices/gbp-all', { ip: '10.0.0.50', headers: auth });
+  const pubFinal = await req('GET', '/api/prices', { ip: '10.0.0.51' });
+  const pubFinalData = await pubFinal.json();
+  check('public prices + discounts empty after cleanup', Object.keys(pubFinalData.prices).length === 0 && Object.keys(pubFinalData.discounts).length === 0, JSON.stringify(pubFinalData));
+
+  const page = await req('GET', '/admin');
+  const html = await page.text();
+  check('admin page has sale price inputs + live pct labels', html.includes('data-sale-input') && html.includes('data-sale-pct') && html.includes('refreshSalePct'));
+  check('calculator shows struck base + discount label', html.includes('class="disc"') && html.includes('<s>'));
+}
+
 // ---------- logout ----------
 {
   const out = await req('POST', '/api/admin/logout', { ip: '10.0.0.6', headers: { Cookie: cookie } });

@@ -12,7 +12,8 @@
  * files, no external assets, so there is no static-file allowlist to keep
  * in sync. It has three tabs: stock management, the quote calculator
  * (client cards with chosen services/products and totals), and service
- * price editing (overrides that the shop picks up via GET /api/prices).
+ * price editing (overrides + optional sale prices that the shop picks up
+ * via GET /api/prices; the discount % is computed from the two prices).
  *
  * Stock semantics: a missing row, or a NULL value, means "unset" — the
  * shop shows no stock line for that product. stock = 0 means "out of
@@ -326,6 +327,29 @@ async function ensureSchema(env) {
   } catch (e) {
     console.error('ensureSchema v4 error:', e && e.message ? e.message : e);
   }
+  // v5: discounts — optional per-service sale prices. The discount % is
+  // computed from the effective base price and the sale price, never
+  // stored. Services only, like price overrides.
+  try {
+    const flag5 = await env.STOCK_DB.prepare(
+      "SELECT value FROM schema_meta WHERE key = 'v5_discounts'",
+    ).first();
+    if (!flag5 || flag5.value !== '1') {
+      await env.STOCK_DB.batch([
+        env.STOCK_DB.prepare(
+          'CREATE TABLE IF NOT EXISTS discounts (' +
+          'id TEXT PRIMARY KEY, ' +
+          'sale_price INTEGER NOT NULL, ' +
+          'updated_at INTEGER NOT NULL)',
+        ),
+        env.STOCK_DB.prepare(
+          "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('v5_discounts', '1')",
+        ),
+      ]);
+    }
+  } catch (e) {
+    console.error('ensureSchema v5 error:', e && e.message ? e.message : e);
+  }
   schemaChecked = true;
 }
 
@@ -599,6 +623,8 @@ async function handleCatalog(env, request) {
       price: c.price,
       monthly: c.monthly,
       editable: c.editable,
+      salePrice: c.salePrice,
+      discountPct: c.discountPct,
     })),
   });
 }
@@ -625,8 +651,11 @@ function buildQuoteItems(bodyItems, catalogMap) {
     const qty = raw.qty;
     if (typeof qty !== 'number' || !Number.isInteger(qty) || qty < 1 || qty > 99) return null;
     // Always the EFFECTIVE catalog price — client-sent prices are ignored
-    // completely. Price editing lives ONLY in the Prices tab.
-    const price = entry.price;
+    // completely. Price editing lives ONLY in the Prices tab. When the
+    // service is discounted, the sale price is what the client pays.
+    const price = (entry.salePrice === null || entry.salePrice === undefined)
+      ? entry.price
+      : entry.salePrice;
     items.push({ id: entry.id, name: entry.name, qty, price, monthly: entry.monthly });
     if (entry.monthly) totalMonthly += price * qty;
     else totalOnce += price * qty;
@@ -717,16 +746,41 @@ async function loadOverrides(env) {
   return map;
 }
 
+async function loadDiscounts(env) {
+  const { results } = await env.STOCK_DB.prepare('SELECT id, sale_price FROM discounts').all();
+  const map = new Map();
+  for (const row of results || []) {
+    if (SERVICE_ID_SET.has(row.id) && Number.isInteger(row.sale_price)) map.set(row.id, row.sale_price);
+  }
+  return map;
+}
+
+// Discount % is COMPUTED from the base price and the sale price (whole
+// percent, rounded). No % is ever stored or accepted as input. A zero
+// base price cannot have a discount.
+function discountPctFor(base, sale) {
+  if (!Number.isInteger(base) || !Number.isInteger(sale)) return null;
+  if (base <= 0 || sale < 0 || sale >= base) return null;
+  return Math.round(((base - sale) / base) * 100);
+}
+
 async function effectiveCatalog(env) {
   const overrides = await loadOverrides(env);
-  return CATALOG.map((c) => ({
-    id: c.id,
-    group: c.group,
-    name: c.name,
-    price: overrides.has(c.id) ? overrides.get(c.id) : c.price,
-    monthly: c.monthly,
-    editable: c.editable,
-  }));
+  const discounts = await loadDiscounts(env);
+  return CATALOG.map((c) => {
+    const price = overrides.has(c.id) ? overrides.get(c.id) : c.price;
+    const salePrice = discounts.has(c.id) ? discounts.get(c.id) : null;
+    return {
+      id: c.id,
+      group: c.group,
+      name: c.name,
+      price,
+      monthly: c.monthly,
+      editable: c.editable,
+      salePrice,
+      discountPct: salePrice === null ? null : discountPctFor(price, salePrice),
+    };
+  });
 }
 
 async function handlePublicPrices(env, request) {
@@ -735,24 +789,34 @@ async function handlePublicPrices(env, request) {
   const overrides = await loadOverrides(env);
   const out = {};
   for (const [id, price] of overrides) out[id] = price;
-  return json({ prices: out }, 200, corsHeaders(request));
+  const discounts = await loadDiscounts(env);
+  const disc = {};
+  for (const [id, salePrice] of discounts) disc[id] = salePrice;
+  return json({ prices: out, discounts: disc }, 200, corsHeaders(request));
 }
 
 async function handleAdminPricesGet(env, request) {
   const session = await requireSession(env, request);
   if (!session) return error('შესვლა საჭიროა.', 401);
   const overrides = await loadOverrides(env);
+  const discounts = await loadDiscounts(env);
   return json({
-    items: SERVICE_CATALOG.map((c) => ({
-      id: c.id,
-      group: c.group,
-      name: c.name,
-      price: overrides.has(c.id) ? overrides.get(c.id) : c.price,
-      defaultPrice: c.price,
-      monthly: c.monthly,
-      editable: c.editable,
-      overridden: overrides.has(c.id),
-    })),
+    items: SERVICE_CATALOG.map((c) => {
+      const price = overrides.has(c.id) ? overrides.get(c.id) : c.price;
+      const salePrice = discounts.has(c.id) ? discounts.get(c.id) : null;
+      return {
+        id: c.id,
+        group: c.group,
+        name: c.name,
+        price,
+        defaultPrice: c.price,
+        monthly: c.monthly,
+        editable: c.editable,
+        overridden: overrides.has(c.id),
+        salePrice,
+        discountPct: salePrice === null ? null : discountPctFor(price, salePrice),
+      };
+    }),
   });
 }
 
@@ -772,17 +836,49 @@ async function handleAdminPricesPost(env, request) {
   if (typeof price !== 'number' || !Number.isInteger(price) || price < 0 || price > CONFIG.maxQty) {
     return error('ფასი უნდა იყოს მთელი რიცხვი 0–99999.', 400);
   }
+  // Sale price: null or omitted clears the discount. Otherwise it must be
+  // a whole number strictly below the price being saved, and the price
+  // must be above zero (a 0₾ service cannot be discounted).
+  const saleRaw = body ? body.sale_price : undefined;
+  let salePrice = null;
+  if (saleRaw !== null && saleRaw !== undefined) {
+    if (typeof saleRaw !== 'number' || !Number.isInteger(saleRaw) || saleRaw < 0 || saleRaw > CONFIG.maxQty) {
+      return error('ფასდაკლების ფასი უნდა იყოს მთელი რიცხვი 0–99999.', 400);
+    }
+    if (price <= 0 || saleRaw >= price) {
+      return error('ფასდაკლების ფასი ფასზე ნაკლები უნდა იყოს.', 400);
+    }
+    salePrice = saleRaw;
+  }
   const entry = CATALOG_MAP.get(id);
+  let overridden;
   if (price === entry.price) {
     // Saving the default removes the override.
     await env.STOCK_DB.prepare('DELETE FROM price_overrides WHERE id = ?').bind(id).run();
-    return json({ ok: true, id, price, overridden: false });
+    overridden = false;
+  } else {
+    await env.STOCK_DB.prepare(
+      'INSERT INTO price_overrides (id, price, updated_at) VALUES (?, ?, ?) ' +
+      'ON CONFLICT(id) DO UPDATE SET price = excluded.price, updated_at = excluded.updated_at',
+    ).bind(id, price, Date.now()).run();
+    overridden = true;
   }
-  await env.STOCK_DB.prepare(
-    'INSERT INTO price_overrides (id, price, updated_at) VALUES (?, ?, ?) ' +
-    'ON CONFLICT(id) DO UPDATE SET price = excluded.price, updated_at = excluded.updated_at',
-  ).bind(id, price, Date.now()).run();
-  return json({ ok: true, id, price, overridden: true });
+  if (salePrice === null) {
+    await env.STOCK_DB.prepare('DELETE FROM discounts WHERE id = ?').bind(id).run();
+  } else {
+    await env.STOCK_DB.prepare(
+      'INSERT INTO discounts (id, sale_price, updated_at) VALUES (?, ?, ?) ' +
+      'ON CONFLICT(id) DO UPDATE SET sale_price = excluded.sale_price, updated_at = excluded.updated_at',
+    ).bind(id, salePrice, Date.now()).run();
+  }
+  return json({
+    ok: true,
+    id,
+    price,
+    overridden,
+    salePrice,
+    discountPct: salePrice === null ? null : discountPctFor(price, salePrice),
+  });
 }
 
 async function handlePriceDelete(env, request, id) {
@@ -790,7 +886,8 @@ async function handlePriceDelete(env, request, id) {
   const session = await requireSession(env, request);
   if (!session) return error('შესვლა საჭიროა.', 401);
   await env.STOCK_DB.prepare('DELETE FROM price_overrides WHERE id = ?').bind(id).run();
-  return json({ ok: true, id, price: CATALOG_MAP.get(id).price });
+  await env.STOCK_DB.prepare('DELETE FROM discounts WHERE id = ?').bind(id).run();
+  return json({ ok: true, id, price: CATALOG_MAP.get(id).price, salePrice: null, discountPct: null });
 }
 
 /* ------------------------------------------------------------------ */
@@ -875,6 +972,8 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
 .calc-ctl input[type=number]{width:62px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 6px;font-size:15px;text-align:center;-moz-appearance:textfield}
 .calc-ctl input[type=number]::-webkit-outer-spin-button,.calc-ctl input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
 .calc-ctl .pr{font-weight:700;white-space:nowrap;font-size:15px;min-width:52px;text-align:right}
+.calc-ctl .pr s{color:var(--muted);font-weight:400}
+.calc-ctl .disc{color:#f5c86b;font-weight:700}
 .totals{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:16px 0}
 .total-box{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:12px;text-align:center}
 .total-box span{display:block;font-size:12px;color:var(--muted)}
@@ -897,8 +996,12 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
 .price-row .nm{font-size:15px}
 .price-row .nm small{display:block;color:var(--muted);font-size:12px}
 .price-row .changed{color:#f5c86b;font-weight:600}
-.price-ctl{display:flex;gap:6px;align-items:center}
+.price-ctl{display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+.price-ctl-row{display:flex;gap:6px;align-items:center}
 .price-ctl input[type=number]{width:72px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 6px;font-size:15px;text-align:center;-moz-appearance:textfield}
+.sale-label{font-size:12px;color:var(--muted);white-space:nowrap}
+.sale-pct{color:#f5c86b;font-weight:700;white-space:nowrap;font-size:14px;min-width:46px;text-align:right}
+.sale-pct[hidden]{display:none}
 .price-ctl input[type=number]::-webkit-outer-spin-button,.price-ctl input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
 .btn-sm{padding:8px 14px;font-size:14px}
 .btn-reset{background:transparent;border-color:rgba(255,255,255,.25);color:var(--muted)}
@@ -951,7 +1054,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
       <div id="quote-list"></div>
     </div>
     <div id="tab-prices" hidden>
-      <p class="sub">ფასის შეცვლა მაშინვე აისახება საიტზე და კალკულატორში.</p>
+      <p class="sub">ფასის და ფასდაკლების შეცვლა მაშინვე აისახება საიტზე და კალკულატორში.</p>
       <div class="err" id="prices-err" hidden></div>
       <div id="price-rows"><p class="sub">იტვირთება…</p></div>
     </div>
@@ -1138,7 +1241,18 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
       for (var ii = 0; ii < items.length; ii++) {
         var item = items[ii];
         // Static price text only — price editing lives in the Prices tab.
-        var priceHtml = '<span class="pr">' + item.price + '₾' + (item.monthly ? '/თვე' : (item.editable ? '-დან' : '')) + '</span>';
+        // A discounted service shows the struck-through base price, the
+        // sale price, and the computed % label.
+        var suffix = item.monthly ? '/თვე' : (item.editable ? '-დან' : '');
+        var hasDisc = item.salePrice !== null && item.salePrice !== undefined && item.price > 0 && item.salePrice < item.price;
+        var priceHtml;
+        if (hasDisc) {
+          var pct = item.discountPct;
+          if (pct === null || pct === undefined) pct = Math.round((item.price - item.salePrice) / item.price * 100);
+          priceHtml = '<span class="pr"><s>' + item.price + '₾' + suffix + '</s> ' + item.salePrice + '₾' + suffix + ' <span class="disc">−' + pct + '%</span></span>';
+        } else {
+          priceHtml = '<span class="pr">' + item.price + '₾' + suffix + '</span>';
+        }
         out += '<div class="calc-item" data-item="' + item.id + '">' +
           '<input type="checkbox" data-check="' + item.id + '" aria-label="' + escHtml(item.name) + '">' +
           '<span class="nm">' + escHtml(item.name) + '</span>' +
@@ -1175,8 +1289,9 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     for (var j = 0; j < sel.length; j++) {
       var entry = map[sel[j].id];
       if (!entry) continue;
-      if (entry.monthly) monthly += entry.price * sel[j].qty;
-      else once += entry.price * sel[j].qty;
+      var charge = (entry.salePrice === null || entry.salePrice === undefined) ? entry.price : entry.salePrice;
+      if (entry.monthly) monthly += charge * sel[j].qty;
+      else once += charge * sel[j].qty;
     }
     document.getElementById('total-once').textContent = once + '₾';
     document.getElementById('total-monthly').textContent = monthly + '₾/თვე';
@@ -1350,11 +1465,30 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     return '₾';
   }
 
-  function refreshPriceRow(row, overridden) {
+  function refreshPriceRow(row, overridden, hasDiscount) {
     var def = row.getAttribute('data-default');
     var small = row.querySelector('.nm small');
     small.innerHTML = priceRowHint(row) + (overridden ? ' · <span class="changed">შეცვლილი (ნაგულისხმევი: ' + def + '₾)</span>' : '');
-    row.querySelector('[data-price-reset]').hidden = !overridden;
+    // The reset button clears BOTH the override and the discount, so it
+    // shows whenever either one is set.
+    row.querySelector('[data-price-reset]').hidden = !(overridden || hasDiscount);
+  }
+
+  // Live discount % from the row's current price and sale-price fields.
+  // Hidden when the sale field is empty, invalid, or not below the price.
+  function refreshSalePct(row) {
+    var priceVal = row.querySelector('[data-price-input]').value.trim();
+    var saleVal = row.querySelector('[data-sale-input]').value.trim();
+    var pctEl = row.querySelector('[data-sale-pct]');
+    var price = priceVal === '' ? NaN : parseInt(priceVal, 10);
+    var sale = saleVal === '' ? NaN : parseInt(saleVal, 10);
+    if (isNaN(price) || isNaN(sale) || price <= 0 || sale < 0 || sale >= price) {
+      pctEl.hidden = true;
+      pctEl.textContent = '';
+      return;
+    }
+    pctEl.textContent = '−' + Math.round((price - sale) / price * 100) + '%';
+    pctEl.hidden = false;
   }
 
   function renderPrices(items) {
@@ -1373,14 +1507,25 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
       for (var ri = 0; ri < rows.length; ri++) {
         var item = rows[ri];
         var hint = item.monthly ? '₾/თვე' : (item.editable ? '₾-დან' : '₾');
+        var hasDisc = item.salePrice !== null && item.salePrice !== undefined;
+        var pctHtml = (hasDisc && item.discountPct !== null && item.discountPct !== undefined)
+          ? '−' + item.discountPct + '%'
+          : '';
         out += '<div class="price-row" data-price-row="' + item.id + '" data-default="' + item.defaultPrice + '" data-monthly="' + (item.monthly ? '1' : '0') + '" data-editable="' + (item.editable ? '1' : '0') + '">' +
           '<span class="nm">' + escHtml(item.name) +
             '<small>' + hint + (item.overridden ? ' · <span class="changed">შეცვლილი (ნაგულისხმევი: ' + item.defaultPrice + '₾)</span>' : '') + '</small></span>' +
           '<span class="price-ctl">' +
-            '<input type="number" inputmode="numeric" min="0" max="99999" value="' + item.price + '" data-price-input aria-label="ფასი">' +
-            '<button class="btn btn-sm" type="button" data-price-save>შენახვა</button>' +
-            '<button class="btn btn-sm btn-reset" type="button" data-price-reset aria-label="ნაგულისხმევზე დაბრუნება"' + (item.overridden ? '' : ' hidden') + '>↺</button>' +
-            '<span class="saved" hidden>შენახულია ✓</span>' +
+            '<span class="price-ctl-row">' +
+              '<input type="number" inputmode="numeric" min="0" max="99999" value="' + item.price + '" data-price-input aria-label="ფასი">' +
+              '<button class="btn btn-sm" type="button" data-price-save>შენახვა</button>' +
+              '<button class="btn btn-sm btn-reset" type="button" data-price-reset aria-label="ნაგულისხმევზე დაბრუნება"' + ((item.overridden || hasDisc) ? '' : ' hidden') + '>↺</button>' +
+              '<span class="saved" hidden>შენახულია ✓</span>' +
+            '</span>' +
+            '<span class="price-ctl-row">' +
+              '<span class="sale-label">ფასდაკლება ₾</span>' +
+              '<input type="number" inputmode="numeric" min="0" max="99999" placeholder="—" value="' + (hasDisc ? item.salePrice : '') + '" data-sale-input aria-label="ფასდაკლების ფასი">' +
+              '<span class="sale-pct" data-sale-pct' + (pctHtml ? '' : ' hidden') + '>' + pctHtml + '</span>' +
+            '</span>' +
           '</span>' +
         '</div>';
       }
@@ -1390,6 +1535,12 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
   }
 
   document.getElementById('tab-btn-prices').addEventListener('click', function () { switchTab('prices'); });
+
+  document.getElementById('price-rows').addEventListener('input', function (e) {
+    var row = e.target.closest ? e.target.closest('[data-price-row]') : null;
+    if (!row) return;
+    if (e.target.hasAttribute('data-price-input') || e.target.hasAttribute('data-sale-input')) refreshSalePct(row);
+  });
 
   document.getElementById('price-rows').addEventListener('click', function (e) {
     var saveBtn = e.target.closest ? e.target.closest('[data-price-save]') : null;
@@ -1407,17 +1558,28 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
         errBox.hidden = false;
         return;
       }
+      var saleVal = row.querySelector('[data-sale-input]').value.trim();
+      var salePrice = null;
+      if (saleVal !== '') {
+        salePrice = parseInt(saleVal, 10);
+        if (isNaN(salePrice) || salePrice < 0 || salePrice > 99999 || price <= 0 || salePrice >= price) {
+          errBox.textContent = 'ფასდაკლების ფასი ფასზე ნაკლები მთელი რიცხვი უნდა იყოს.';
+          errBox.hidden = false;
+          return;
+        }
+      }
       saveBtn.disabled = true;
       fetch('/api/admin/prices', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: id, price: price })
+        body: JSON.stringify({ id: id, price: price, sale_price: salePrice })
       }).then(function (res) {
         saveBtn.disabled = false;
         if (!res.ok) throw new Error('save');
         return res.json();
       }).then(function (data) {
-        refreshPriceRow(row, !!(data && data.overridden));
+        refreshPriceRow(row, !!(data && data.overridden), !!(data && data.salePrice !== null && data.salePrice !== undefined));
+        refreshSalePct(row);
         catalogLoaded = false;
         var saved = row.querySelector('.saved');
         saved.hidden = false;
@@ -1435,7 +1597,9 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
         return res.json();
       }).then(function (data) {
         row.querySelector('[data-price-input]').value = String(data.price);
-        refreshPriceRow(row, false);
+        row.querySelector('[data-sale-input]').value = '';
+        refreshPriceRow(row, false, false);
+        refreshSalePct(row);
         catalogLoaded = false;
       }).catch(function () {
         resetBtn.disabled = false;
