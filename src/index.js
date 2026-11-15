@@ -170,44 +170,67 @@ let schemaChecked = false;
 
 async function ensureSchema(env) {
   if (schemaChecked) return;
+  let v1done = false;
   try {
     const flag = await env.STOCK_DB.prepare(
       "SELECT value FROM schema_meta WHERE key = 'v1_stock'",
     ).first();
-    if (flag && flag.value === '1') {
-      schemaChecked = true;
-      return;
-    }
+    v1done = !!(flag && flag.value === '1');
   } catch (e) {
     // schema_meta (or the flag) does not exist yet — migrate below.
   }
-  await env.STOCK_DB.batch([
-    env.STOCK_DB.prepare(
-      'CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
-    ),
-    env.STOCK_DB.prepare(
-      'CREATE TABLE IF NOT EXISTS stock (' +
-      'slug TEXT PRIMARY KEY, ' +
-      'stock INTEGER, ' +
-      'incoming INTEGER, ' +
-      'updated_at INTEGER NOT NULL)',
-    ),
-    env.STOCK_DB.prepare(
-      'CREATE TABLE IF NOT EXISTS sessions (' +
-      'token_hash TEXT PRIMARY KEY, ' +
-      'created_at INTEGER NOT NULL, ' +
-      'expires_at INTEGER NOT NULL)',
-    ),
-    env.STOCK_DB.prepare(
-      'CREATE TABLE IF NOT EXISTS rate_limits (' +
-      'key TEXT PRIMARY KEY, ' +
-      'count INTEGER NOT NULL, ' +
-      'window_start INTEGER NOT NULL)',
-    ),
-    env.STOCK_DB.prepare(
-      "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('v1_stock', '1')",
-    ),
-  ]);
+  if (!v1done) {
+    await env.STOCK_DB.batch([
+      env.STOCK_DB.prepare(
+        'CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+      ),
+      env.STOCK_DB.prepare(
+        'CREATE TABLE IF NOT EXISTS stock (' +
+        'slug TEXT PRIMARY KEY, ' +
+        'stock INTEGER, ' +
+        'incoming INTEGER, ' +
+        'updated_at INTEGER NOT NULL)',
+      ),
+      env.STOCK_DB.prepare(
+        'CREATE TABLE IF NOT EXISTS sessions (' +
+        'token_hash TEXT PRIMARY KEY, ' +
+        'created_at INTEGER NOT NULL, ' +
+        'expires_at INTEGER NOT NULL)',
+      ),
+      env.STOCK_DB.prepare(
+        'CREATE TABLE IF NOT EXISTS rate_limits (' +
+        'key TEXT PRIMARY KEY, ' +
+        'count INTEGER NOT NULL, ' +
+        'window_start INTEGER NOT NULL)',
+      ),
+      env.STOCK_DB.prepare(
+        "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('v1_stock', '1')",
+      ),
+    ]);
+  }
+  // v2: security_events — failed logins / login rate-limit hits, IP hash only.
+  try {
+    const flag2 = await env.STOCK_DB.prepare(
+      "SELECT value FROM schema_meta WHERE key = 'v2_security_events'",
+    ).first();
+    if (!flag2 || flag2.value !== '1') {
+      await env.STOCK_DB.batch([
+        env.STOCK_DB.prepare(
+          'CREATE TABLE IF NOT EXISTS security_events (' +
+          'id INTEGER PRIMARY KEY AUTOINCREMENT, ' +
+          'event TEXT NOT NULL, ' +
+          'ip_hash TEXT NOT NULL, ' +
+          'created_at INTEGER NOT NULL)',
+        ),
+        env.STOCK_DB.prepare(
+          "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('v2_security_events', '1')",
+        ),
+      ]);
+    }
+  } catch (e) {
+    // Logging is best-effort: a failed v2 migration must never break requests.
+    console.error('ensureSchema v2 error:', e && e.message ? e.message : e);
+  }
   schemaChecked = true;
 }
 
@@ -311,6 +334,26 @@ async function checkRateLimit(request, env, scope, limit, windowSec) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Security-event logging (IP hash only — raw IPs are never stored)    */
+/* Best-effort: a logging failure must never break login.              */
+/* ------------------------------------------------------------------ */
+
+async function logSecurityEvent(env, event, request) {
+  try {
+    const hash = await ipHash(request, env);
+    await env.STOCK_DB.prepare(
+      'INSERT INTO security_events (event, ip_hash, created_at) VALUES (?, ?, ?)',
+    ).bind(event, hash, Date.now()).run();
+    // Keep 90 days of history so the table does not grow forever.
+    await env.STOCK_DB.prepare(
+      'DELETE FROM security_events WHERE created_at < ?',
+    ).bind(Date.now() - 90 * 24 * 60 * 60 * 1000).run();
+  } catch (e) {
+    console.error('logSecurityEvent error:', e && e.message ? e.message : e);
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* CORS (public stock API only)                                        */
 /* ------------------------------------------------------------------ */
 
@@ -347,7 +390,10 @@ async function handlePublicStock(env, request) {
 async function handleLogin(env, request) {
   if (!originAllowed(request)) return error('არასწორი წყარო (Origin).', 403);
   const allowed = await checkRateLimit(request, env, 'login', CONFIG.loginLimitPerMin, 60);
-  if (!allowed) return error('ძალიან ბევრი მცდელობა — ცოტა ხანში სცადეთ.', 429);
+  if (!allowed) {
+    await logSecurityEvent(env, 'login_rate_limited', request);
+    return error('ძალიან ბევრი მცდელობა — ცოტა ხანში სცადეთ.', 429);
+  }
   let body;
   try {
     body = await request.json();
@@ -355,9 +401,15 @@ async function handleLogin(env, request) {
     return error('არასწორი მონაცემები.', 400);
   }
   const password = body && typeof body.password === 'string' ? body.password : '';
-  if (!env.ADMIN_PASSWORD_HASH) return error('ადმინ პაროლი დაყენებული არ არის.', 503);
-  const ok = await verifyPassword(password, env.ADMIN_PASSWORD_HASH);
-  if (!ok) return error('არასწორი პაროლი.', 401);
+  // Unset hash → the SAME generic 401 as a wrong password: the response
+  // must not reveal whether the admin password is configured.
+  const ok = env.ADMIN_PASSWORD_HASH
+    ? await verifyPassword(password, env.ADMIN_PASSWORD_HASH)
+    : false;
+  if (!ok) {
+    await logSecurityEvent(env, 'login_failed', request);
+    return error('არასწორი პაროლი.', 401);
+  }
   const { token, expiresAt } = await createSession(env);
   return json({ ok: true }, 200, { 'Set-Cookie': sessionCookie(token, expiresAt, isHttps(request)) });
 }
@@ -420,6 +472,22 @@ async function handleAdminStockPost(env, request) {
   return json({ ok: true, slug, stock: stock.value, incoming: incoming.value });
 }
 
+async function handleSecurityEvents(env, request) {
+  const session = await requireSession(env, request);
+  if (!session) return error('შესვლა საჭიროა.', 401);
+  const { results } = await env.STOCK_DB.prepare(
+    'SELECT event, ip_hash, created_at FROM security_events ORDER BY id DESC LIMIT 50',
+  ).all();
+  // Only a truncated hash leaves the server — enough to correlate, nothing more.
+  return json({
+    events: (results || []).map((r) => ({
+      event: r.event,
+      ip: String(r.ip_hash).slice(0, 12),
+      created_at: r.created_at,
+    })),
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* Admin page (one self-contained page, no external assets)            */
 /* NOTE: the inline <script> below must not contain backticks or ${ } */
@@ -479,6 +547,10 @@ h1{font-size:24px;margin:0}
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
 input[type=password]{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);padding:11px 13px;margin-bottom:12px}
 label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
+.evt{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-top:1px solid var(--border);font-size:14px}
+.evt:first-child{border-top:0}
+.evt code{color:var(--muted);font-size:12px;word-break:break-all}
+.evt .etime{color:var(--muted);font-size:12px;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -499,6 +571,10 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     <div class="topbar"><h1>მარაგი</h1><button class="btn btn-outline" id="logout-btn" type="button">გასვლა</button></div>
     <p class="sub">ცარიელი ველი = რაოდენობა არ ჩანს მაღაზიაში.</p>
     <div id="rows">${adminRowsHtml()}</div>
+    <div class="card">
+      <h2>უსაფრთხოების მოვლენები</h2>
+      <div id="sec-events"><p class="sub">იტვირთება…</p></div>
+    </div>
   </div>
 </div>
 <script>
@@ -531,9 +607,30 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
 
   function checkSession() {
     fetch('/api/admin/session').then(function (res) {
-      if (res.ok) { showPanel(); return loadStock(); }
+      if (res.ok) { showPanel(); loadSecEvents(); return loadStock(); }
       showLogin();
     }).catch(function () { showLogin(); });
+  }
+
+  function loadSecEvents() {
+    fetch('/api/admin/security-events').then(function (res) {
+      if (!res.ok) throw new Error('sec');
+      return res.json();
+    }).then(function (data) {
+      var box = document.getElementById('sec-events');
+      var evts = (data && data.events) || [];
+      if (!evts.length) { box.innerHTML = '<p class="sub">მოვლენები არ არის.</p>'; return; }
+      var labels = { login_failed: 'წარუმატებელი შესვლა', login_rate_limited: 'შესვლის ლიმიტი ამოიწურა' };
+      var out = '';
+      for (var i = 0; i < evts.length; i++) {
+        var e = evts[i];
+        var when = new Date(e.created_at).toLocaleString('ka-GE');
+        out += '<div class="evt"><span>' + (labels[e.event] || 'უცნობი მოვლენა') + ' <code>' + e.ip + '</code></span><span class="etime">' + when + '</span></div>';
+      }
+      box.innerHTML = out;
+    }).catch(function () {
+      document.getElementById('sec-events').innerHTML = '<p class="sub">ვერ ჩაიტვირთა.</p>';
+    });
   }
 
   loginForm.addEventListener('submit', function (e) {
@@ -546,6 +643,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     }).then(function (res) {
       if (!res.ok) throw new Error('login');
       showPanel();
+      loadSecEvents();
       return loadStock();
     }).catch(function () {
       loginErr.textContent = 'არასწორი პაროლი. სცადეთ თავიდან.';
@@ -623,6 +721,12 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // Force HTTPS in production; localhost is exempt so local dev and
+    // the offline harness keep working over plain http.
+    if (url.protocol === 'http:' && url.hostname !== 'localhost' && url.hostname !== '127.0.0.1' && url.hostname !== '[::1]') {
+      return Response.redirect('https://' + url.host + url.pathname + url.search, 301);
+    }
+
     try {
       await ensureSchema(env);
     } catch (e) {
@@ -667,6 +771,9 @@ export default {
     }
     if (path === '/api/admin/stock' && request.method === 'POST') {
       return handleAdminStockPost(env, request);
+    }
+    if (path === '/api/admin/security-events' && request.method === 'GET') {
+      return handleSecurityEvents(env, request);
     }
 
     return error('ვერ მოიძებნა.', 404);

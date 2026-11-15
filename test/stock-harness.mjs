@@ -67,10 +67,31 @@ async function req(method, path, { headers = {}, body = null, ip = '10.0.0.1' } 
   return worker.fetch(new Request(BASE + path, init), env);
 }
 
+// Same as req() but with an explicit full URL (for http/https redirect tests).
+async function reqFull(method, url, { headers = {}, body = null, ip = '10.0.0.1' } = {}) {
+  const init = { method, headers: { 'CF-Connecting-IP': ip, ...headers } };
+  if (body !== null) init.body = typeof body === 'string' ? body : JSON.stringify(body);
+  return worker.fetch(new Request(url, init), env);
+}
+
 function cookieFrom(res) {
   const setCookie = res.headers.get('set-cookie') || '';
   const m = setCookie.match(/stock_session=[^;]+/);
   return m ? m[0] : null;
+}
+
+// ---------- https redirect ----------
+{
+  const r1 = await reqFull('GET', 'http://locallink-stock.shao42ia.workers.dev/');
+  check('http root redirects 301 to https', r1.status === 301 && r1.headers.get('location') === 'https://locallink-stock.shao42ia.workers.dev/', 'status=' + r1.status);
+  const r2 = await reqFull('GET', 'http://locallink-stock.shao42ia.workers.dev/api/stock?x=1&y=2');
+  check('http redirect preserves path+query', r2.status === 301 && r2.headers.get('location') === 'https://locallink-stock.shao42ia.workers.dev/api/stock?x=1&y=2', r2.headers.get('location'));
+  const r3 = await reqFull('GET', 'https://locallink-stock.shao42ia.workers.dev/');
+  check('https passes through (no redirect)', r3.status === 200, 'status=' + r3.status);
+  const r4 = await reqFull('GET', 'http://localhost:8787/');
+  check('http localhost exempt from redirect', r4.status === 200, 'status=' + r4.status);
+  const r5 = await reqFull('GET', 'http://127.0.0.1:8787/api/stock');
+  check('http 127.0.0.1 exempt from redirect', r5.status === 200, 'status=' + r5.status);
 }
 
 // ---------- public status + admin page ----------
@@ -132,6 +153,20 @@ let cookie = null;
   check('session check accepts valid cookie', sess.status === 200);
   const badCookie = await req('GET', '/api/admin/session', { ip: '10.0.0.6', headers: { Cookie: 'stock_session=' + '0'.repeat(64) } });
   check('session check rejects forged cookie', badCookie.status === 401);
+}
+
+// ---------- login with unset hash: same generic 401, no config leak ----------
+{
+  const envNoHash = { ...env };
+  delete envNoHash.ADMIN_PASSWORD_HASH;
+  const res = await worker.fetch(new Request(BASE + '/api/admin/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '10.0.0.20' },
+    body: JSON.stringify({ password: 'anything' }),
+  }), envNoHash);
+  const data = await res.json();
+  check('unset hash login returns 401 (not 503)', res.status === 401, 'status=' + res.status);
+  check('unset hash error is the generic message', data.error === 'არასწორი პაროლი.', JSON.stringify(data));
 }
 
 // ---------- admin upsert + validation ----------
@@ -200,6 +235,37 @@ let cookie = null;
   check('public stock rate limit: 121st request 429', last === 429, 'last=' + last);
   const otherIp = await req('GET', '/api/stock', { ip: '10.0.0.12' });
   check('rate limit is per-IP (other IP still 200)', otherIp.status === 200);
+}
+
+// ---------- security events ----------
+{
+  const countEvents = (type) => db.prepare('SELECT COUNT(*) AS n FROM security_events WHERE event = ?').get(type).n;
+
+  const beforeFailed = countEvents('login_failed');
+  await req('POST', '/api/admin/login', { ip: '10.0.0.21', headers: { 'Content-Type': 'application/json' }, body: { password: 'wrong' } });
+  check('failed login writes login_failed event', countEvents('login_failed') === beforeFailed + 1);
+
+  const beforeLimited = countEvents('login_rate_limited');
+  let statuses = [];
+  for (let i = 0; i < 6; i++) {
+    const r = await req('POST', '/api/admin/login', { ip: '10.0.0.22', headers: { 'Content-Type': 'application/json' }, body: { password: 'wrong' } });
+    statuses.push(r.status);
+  }
+  check('rate-limited login writes login_rate_limited event', statuses[5] === 429 && countEvents('login_rate_limited') === beforeLimited + 1, statuses.join(','));
+
+  const rows = db.prepare('SELECT ip_hash FROM security_events').all();
+  check('security events store hashes only (no raw IP)', rows.length > 0 && rows.every((r) => /^[0-9a-f]{64}$/.test(r.ip_hash)), 'rows=' + rows.length);
+
+  const list = await req('GET', '/api/admin/security-events', { ip: '10.0.0.7', headers: { Cookie: cookie } });
+  const listData = await list.json();
+  check('admin security-events endpoint 200 with cookie', list.status === 200 && Array.isArray(listData.events), 'status=' + list.status);
+  check('admin events show truncated hash only', listData.events.length > 0 && listData.events.every((e) => typeof e.ip === 'string' && /^[0-9a-f]{12}$/.test(e.ip)), 'events=' + listData.events.length);
+  const listNoAuth = await req('GET', '/api/admin/security-events', { ip: '10.0.0.23' });
+  check('admin security-events rejects unauthenticated', listNoAuth.status === 401);
+
+  const page = await req('GET', '/admin');
+  const html = await page.text();
+  check('admin page shows security events section', html.includes('უსაფრთხოების მოვლენები') && html.includes('/api/admin/security-events'));
 }
 
 // ---------- logout ----------
