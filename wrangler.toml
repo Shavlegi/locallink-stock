@@ -30,4 +30,4 @@ compatibility_date = "2025-11-01"
 [[d1_databases]]
 binding = "STOCK_DB"
 database_name = "locallink-stock-db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "4dad6237-f37c-45c4-b3b8-da72757e6fbb"
