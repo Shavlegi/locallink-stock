@@ -611,6 +611,8 @@ function buildQuoteItems(bodyItems) {
     if (entry.monthly) totalMonthly += price * qty;
     else totalOnce += price * qty;
   }
+  // The bundle and its parts are mutually exclusive — never count both.
+  if (seen.has('gbp-all') && (seen.has('gbp-create') || seen.has('gbp-fill') || seen.has('gbp-verify'))) return null;
   return { items, totalOnce, totalMonthly };
 }
 
@@ -754,8 +756,9 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
 .calc-item:first-of-type{border-top:0}
 .calc-item input[type=checkbox]{width:20px;height:20px;accent-color:var(--accent);cursor:pointer}
 .calc-item .nm{font-size:15px}
-.calc-ctl{display:none;gap:6px;align-items:center}
-.calc-item.on .calc-ctl{display:flex}
+.calc-ctl{display:flex;gap:6px;align-items:center}
+.calc-ctl .qty-input{display:none}
+.calc-item.on .calc-ctl .qty-input{display:block}
 .calc-ctl input[type=number]{width:62px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 6px;font-size:15px;text-align:center;-moz-appearance:textfield}
 .calc-ctl input[type=number]::-webkit-outer-spin-button,.calc-ctl input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
 .calc-ctl .pr{font-weight:700;white-space:nowrap;font-size:15px;min-width:52px;text-align:right}
@@ -1052,6 +1055,31 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     document.getElementById('total-monthly').textContent = monthly + '₾/თვე';
   }
 
+  /* The "all three together" bundle and its three parts are mutually
+     exclusive: checking one side unchecks the other, so the bundle is
+     never counted together with a component. */
+  var GBP_PARTS = ['gbp-create', 'gbp-fill', 'gbp-verify'];
+  function enforceBundle(changedId) {
+    var boxes = {};
+    var all = document.querySelectorAll('[data-check]');
+    for (var i = 0; i < all.length; i++) boxes[all[i].getAttribute('data-check')] = all[i];
+    function uncheck(id) {
+      var cb = boxes[id];
+      if (cb && cb.checked) {
+        cb.checked = false;
+        var r = cb.closest('.calc-item');
+        if (r) r.classList.remove('on');
+      }
+    }
+    if (changedId === 'gbp-all') {
+      if (boxes['gbp-all'] && boxes['gbp-all'].checked) {
+        uncheck('gbp-create'); uncheck('gbp-fill'); uncheck('gbp-verify');
+      }
+    } else if (GBP_PARTS.indexOf(changedId) !== -1) {
+      if (boxes[changedId] && boxes[changedId].checked) uncheck('gbp-all');
+    }
+  }
+
   function loadQuotes() {
     if (quotesLoaded) return;
     fetch('/api/admin/quotes').then(function (res) {
@@ -1102,6 +1130,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     if (!cb) return;
     cb.checked = !cb.checked;
     if (cb.checked) row.classList.add('on'); else row.classList.remove('on');
+    enforceBundle(cb.getAttribute('data-check'));
     updateTotals();
   });
 
@@ -1110,6 +1139,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     if (cb) {
       var row = cb.closest('.calc-item');
       if (cb.checked) row.classList.add('on'); else row.classList.remove('on');
+      enforceBundle(cb.getAttribute('data-check'));
     }
     updateTotals();
   });

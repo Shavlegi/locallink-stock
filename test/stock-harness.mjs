@@ -350,6 +350,19 @@ let cookie = null;
   const page = await req('GET', '/admin');
   const html = await page.text();
   check('admin page has calculator tab + endpoints', html.includes('კალკულატორი') && html.includes('/api/admin/quotes') && html.includes('/api/admin/catalog') && html.includes('tab-btn-calc'));
+  check('admin page enforces bundle exclusivity in UI', html.includes('enforceBundle') && html.includes('gbp-all') && html.includes('gbp-verify'));
+  check('admin page shows prices before checking (qty hidden until checked)', html.includes('.calc-ctl .qty-input{display:none}') && html.includes('.calc-item.on .calc-ctl .qty-input{display:block}'));
+
+  // Bundle + component in one quote must be rejected server-side.
+  const bundleMix = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'gbp-all', qty: 1 }, { id: 'gbp-create', qty: 1 }] } });
+  check('quote rejects bundle + component together', bundleMix.status === 400);
+  const bundleMix2 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'gbp-verify', qty: 1 }, { id: 'gbp-all', qty: 1 }, { id: 'logo', qty: 1 }] } });
+  check('quote rejects bundle + component among others', bundleMix2.status === 400);
+  const bundleOnly = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'gbp-all', qty: 1 }] } });
+  check('quote accepts bundle alone', bundleOnly.status === 200);
+  const partsOnly = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'gbp-create', qty: 1 }, { id: 'gbp-fill', qty: 1 }, { id: 'gbp-verify', qty: 1 }] } });
+  const partsOnlyData = await partsOnly.json();
+  check('quote accepts all three parts (60 total)', partsOnly.status === 200 && partsOnlyData.total_once === 60, JSON.stringify(partsOnlyData));
 }
 
 // ---------- logout ----------
