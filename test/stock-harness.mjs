@@ -268,6 +268,90 @@ let cookie = null;
   check('admin page shows security events section', html.includes('უსაფრთხოების მოვლენები') && html.includes('/api/admin/security-events'));
 }
 
+// ---------- calculator: catalog + quotes ----------
+{
+  const auth = { Cookie: cookie };
+  const noAuthCat = await req('GET', '/api/admin/catalog', { ip: '10.0.0.30' });
+  check('catalog rejects unauthenticated', noAuthCat.status === 401);
+  const noAuthQ = await req('GET', '/api/admin/quotes', { ip: '10.0.0.30' });
+  check('quotes GET rejects unauthenticated', noAuthQ.status === 401);
+  const noAuthQP = await req('POST', '/api/admin/quotes', { ip: '10.0.0.30', headers: { 'Content-Type': 'application/json' }, body: { first_name: 'X', items: [{ id: 'logo', qty: 1 }] } });
+  check('quotes POST rejects unauthenticated', noAuthQP.status === 401);
+
+  const cat = await req('GET', '/api/admin/catalog', { ip: '10.0.0.31', headers: auth });
+  const catData = await cat.json();
+  check('catalog 200 with cookie', cat.status === 200 && Array.isArray(catData.items), 'status=' + cat.status);
+  check('catalog has 31 items', catData.items.length === 31, 'n=' + catData.items.length);
+  const byId = {};
+  for (const it of catData.items) byId[it.id] = it;
+  check('catalog prices match price list', byId['gbp-create'].price === 10 && byId['gbp-all'].price === 50 && byId['vip2'].price === 149 && byId['prod-photo-stand'].price === 60);
+  check('catalog editable flags', byId['site-build'].editable === true && byId['banner'].editable === true && byId['gbp-create'].editable === false && byId['logo'].editable === false);
+  check('catalog monthly flags', byId['m-reviews'].monthly === true && byId['vip1'].monthly === true && byId['logo'].monthly === false && byId['call-day'].monthly === false);
+  check('catalog has all 10 groups', new Set(catData.items.map((i) => i.group)).size === 10);
+
+  const emptyList = await req('GET', '/api/admin/quotes', { ip: '10.0.0.31', headers: auth });
+  const emptyData = await emptyList.json();
+  check('quotes list starts empty', emptyList.status === 200 && Array.isArray(emptyData.quotes) && emptyData.quotes.length === 0);
+
+  const noName = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: '  ', items: [{ id: 'logo', qty: 1 }] } });
+  check('quote rejects empty first name', noName.status === 400);
+  const noItems = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [] } });
+  check('quote rejects empty items', noItems.status === 400);
+  const badId = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'nope', qty: 1 }] } });
+  check('quote rejects unknown item id', badId.status === 400);
+  const dup = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'logo', qty: 1 }, { id: 'logo', qty: 1 }] } });
+  check('quote rejects duplicate item id', dup.status === 400);
+  const qty0 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'logo', qty: 0 }] } });
+  check('quote rejects qty 0', qty0.status === 400);
+  const qty100 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'logo', qty: 100 }] } });
+  check('quote rejects qty 100', qty100.status === 400);
+  const badPrice = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'site-build', qty: 1, price: -5 }] } });
+  check('quote rejects negative editable price', badPrice.status === 400);
+  const fracPrice = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', items: [{ id: 'site-build', qty: 1, price: 50.5 }] } });
+  check('quote rejects fractional editable price', fracPrice.status === 400);
+  const crossQ = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example', ...auth }, body: { first_name: 'Nika', items: [{ id: 'logo', qty: 1 }] } });
+  check('quotes POST rejects cross-site Origin', crossQ.status === 403);
+
+  // Fixed-price override must be ignored; editable price honored; totals split once/monthly.
+  const q1 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Nika', last_name: 'Test', phone: '597 111 222', note: 'test note', items: [{ id: 'logo', qty: 2, price: 999 }, { id: 'site-build', qty: 1, price: 75 }, { id: 'm-care', qty: 1 }, { id: 'prod-nfc-stand', qty: 3 }] } });
+  const q1Data = await q1.json();
+  check('quote create 200 with totals', q1.status === 200 && q1Data.total_once === 245 && q1Data.total_monthly === 25, JSON.stringify(q1Data));
+  const q1id = q1Data.id;
+  check('quote create returns numeric id', Number.isInteger(q1id) && q1id > 0, 'id=' + q1id);
+
+  const list1 = await req('GET', '/api/admin/quotes', { ip: '10.0.0.31', headers: auth });
+  const list1Data = await list1.json();
+  check('quotes list has the saved card', list1Data.quotes.length === 1 && list1Data.quotes[0].id === q1id);
+  const card = list1Data.quotes[0];
+  check('card keeps client fields', card.first_name === 'Nika' && card.last_name === 'Test' && card.phone === '597 111 222' && card.note === 'test note');
+  check('card items snapshot has names + enforced prices', card.items.length === 4 && card.items.find((i) => i.id === 'logo').price === 10 && card.items.find((i) => i.id === 'site-build').price === 75 && card.items.find((i) => i.id === 'prod-nfc-stand').qty === 3);
+  check('card monthly flag on snapshot', card.items.find((i) => i.id === 'm-care').monthly === true && card.items.find((i) => i.id === 'logo').monthly === false);
+
+  const q2 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.31', headers: { 'Content-Type': 'application/json', ...auth }, body: { first_name: 'Gio', items: [{ id: 'gbp-all', qty: 1 }] } });
+  check('second quote create 200', q2.status === 200);
+  const list2 = await req('GET', '/api/admin/quotes', { ip: '10.0.0.31', headers: auth });
+  const list2Data = await list2.json();
+  check('quotes list newest first', list2Data.quotes.length === 2 && list2Data.quotes[0].first_name === 'Gio' && list2Data.quotes[1].first_name === 'Nika');
+
+  const delNoAuth = await req('DELETE', '/api/admin/quotes/' + q1id, { ip: '10.0.0.32' });
+  check('quote DELETE rejects unauthenticated', delNoAuth.status === 401);
+  const delCross = await req('DELETE', '/api/admin/quotes/' + q1id, { ip: '10.0.0.31', headers: { Origin: 'https://evil.example', ...auth } });
+  check('quote DELETE rejects cross-site Origin', delCross.status === 403);
+  const delBad = await req('DELETE', '/api/admin/quotes/abc', { ip: '10.0.0.31', headers: auth });
+  check('quote DELETE rejects non-numeric id', delBad.status === 400);
+  const delMissing = await req('DELETE', '/api/admin/quotes/99999', { ip: '10.0.0.31', headers: auth });
+  check('quote DELETE missing id 404', delMissing.status === 404);
+  const del = await req('DELETE', '/api/admin/quotes/' + q1id, { ip: '10.0.0.31', headers: auth });
+  check('quote DELETE 200', del.status === 200);
+  const list3 = await req('GET', '/api/admin/quotes', { ip: '10.0.0.31', headers: auth });
+  const list3Data = await list3.json();
+  check('deleted card gone from list', list3Data.quotes.length === 1 && list3Data.quotes[0].first_name === 'Gio');
+
+  const page = await req('GET', '/admin');
+  const html = await page.text();
+  check('admin page has calculator tab + endpoints', html.includes('კალკულატორი') && html.includes('/api/admin/quotes') && html.includes('/api/admin/catalog') && html.includes('tab-btn-calc'));
+}
+
 // ---------- logout ----------
 {
   const out = await req('POST', '/api/admin/logout', { ip: '10.0.0.6', headers: { Cookie: cookie } });

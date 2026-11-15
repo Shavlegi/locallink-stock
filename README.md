@@ -50,6 +50,10 @@
 | `GET` | `/api/admin/session` | `{ok:true}` თუ შესულია |
 | `GET` | `/api/admin/stock` | ყველა მწკრივი (auth საჭიროა) |
 | `POST` | `/api/admin/stock` | `{slug, stock, incoming}` upsert (auth საჭიროა); რაოდენობა: მთელი რიცხვი 0–99999 ან `null` |
+| `GET` | `/api/admin/catalog` | კალკულატორის კატალოგი: 31 პუნქტი (სერვისები + NFC პროდუქტები) ფასებით, `monthly`/`editable` ნიშნებით (auth საჭიროა) |
+| `GET` | `/api/admin/quotes` | შენახული ბარათები, უახლესი პირველი (auth საჭიროა) |
+| `POST` | `/api/admin/quotes` | `{first_name, last_name, phone, note, items:[{id, qty, price}]}` — ჯამებს სერვერი ითვლის (ერთჯერადი ცალკე, ყოველთვიური ცალკე); ფიქსირებული ფასები კატალოგიდან იღება, „-დან" ფასებზე თანხას ადმინი წერს (auth საჭიროა) |
+| `DELETE` | `/api/admin/quotes/:id` | ბარათის წაშლა (auth საჭიროა) |
 
 ## უსაფრთხოება
 
@@ -66,12 +70,15 @@
 node test/stock-harness.mjs
 ```
 
-44 შემოწმება plain node-ით (D1 mock `node:sqlite`-ზე): საჯარო API-ს
+92 შემოწმება plain node-ით (D1 mock `node:sqlite`-ზე): საჯარო API-ს
 ფორმა + CORS, ლოგინის უარყოფა, არაავტორიზებულის უარყოფა, upsert-ის
-ვალიდაცია, rate limit-ები, logout. ტესტის პაროლი/საიდუმლო მხოლოდ
+ვალიდაცია, rate limit-ები, security events, კალკულატორი (კატალოგი,
+ბარათების შექმნა/წაშლა, ჯამები, ვალიდაცია), logout. ტესტის პაროლი/საიდუმლო მხოლოდ
 ტესტისთვისაა და არ გამოიყენება production-ში.
 
 ## სტატუსი
 
 - 2026-11-15: Worker გაშვებულია (`locallink-stock.shao42ia.workers.dev`),
   D1 `locallink-stock-db` დაკავშირებულია, secrets დაყენებულია.
+- 2026-11-15: კალკულატორი დამატებულია ადმინ პანელზე (ორი ჩანართი: მარაგი /
+  კალკულატორი; ცხრილი `quotes`, მიგრაცია v3).
