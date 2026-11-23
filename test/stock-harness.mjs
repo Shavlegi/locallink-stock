@@ -402,14 +402,17 @@ let cookie = null;
 
   const list = await req('GET', '/api/admin/prices', { ip: '10.0.0.43', headers: auth });
   const listData = await list.json();
-  check('admin prices GET 200 with 26 services', list.status === 200 && Array.isArray(listData.items) && listData.items.length === 26, 'n=' + (listData.items && listData.items.length));
-  check('admin prices excludes products', listData.items.every((i) => !i.id.startsWith('prod-')));
+  check('admin prices GET 200 with 31 items (26 services + 5 products)', list.status === 200 && Array.isArray(listData.items) && listData.items.length === 31, 'n=' + (listData.items && listData.items.length));
+  check('admin prices includes products group', listData.items.filter((i) => i.id.startsWith('prod-')).length === 5 && listData.items.filter((i) => i.id.startsWith('prod-')).every((i) => i.group === 'NFC პროდუქტები' && i.defaultPrice === i.price));
   check('admin prices defaults + flags', listData.items.every((i) => i.price === i.defaultPrice && i.overridden === false && 'monthly' in i && 'editable' in i && 'group' in i));
 
   const badId = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'nope', price: 15 } });
   check('prices POST rejects unknown id', badId.status === 400);
   const prodId = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'prod-nfc-stand', price: 55 } });
-  check('prices POST rejects product id', prodId.status === 400);
+  const prodIdData = await prodId.json();
+  check('prices POST allows product id', prodId.status === 200 && prodIdData.overridden === true && prodIdData.price === 55, JSON.stringify(prodIdData));
+  // Clean up so later public-prices checks in this block stay exact.
+  await req('DELETE', '/api/admin/prices/prod-nfc-stand', { ip: '10.0.0.43', headers: auth });
   const neg = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo', price: -1 } });
   check('prices POST rejects negative price', neg.status === 400);
   const frac = await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'logo', price: 15.5 } });
@@ -459,8 +462,10 @@ let cookie = null;
   check('prices DELETE without override still 200', delAgain.status === 200);
   const delBad = await req('DELETE', '/api/admin/prices/nope', { ip: '10.0.0.43', headers: auth });
   check('prices DELETE rejects unknown id', delBad.status === 400);
+  await req('POST', '/api/admin/prices', { ip: '10.0.0.43', headers: jsonHeaders, body: { id: 'prod-nfc-stand', price: 55 } });
   const delProd = await req('DELETE', '/api/admin/prices/prod-nfc-stand', { ip: '10.0.0.43', headers: auth });
-  check('prices DELETE rejects product id', delProd.status === 400);
+  const delProdData = await delProd.json();
+  check('prices DELETE resets product id to default', delProd.status === 200 && delProdData.price === 50, JSON.stringify(delProdData));
   const delCross = await req('DELETE', '/api/admin/prices/logo', { ip: '10.0.0.43', headers: { Origin: 'https://evil.example', ...auth } });
   check('prices DELETE rejects cross-site Origin', delCross.status === 403);
 
@@ -512,7 +517,10 @@ let cookie = null;
   const unknownSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'nope', price: 10, sale_price: 7 } });
   check('discount rejects unknown id', unknownSale.status === 400);
   const prodSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: jsonHeaders, body: { id: 'prod-nfc-stand', price: 50, sale_price: 40 } });
-  check('discount rejects product id', prodSale.status === 400);
+  const prodSaleData = await prodSale.json();
+  check('discount allows product id (50→40 = 20%)', prodSale.status === 200 && prodSaleData.salePrice === 40 && prodSaleData.discountPct === 20, JSON.stringify(prodSaleData));
+  // Clean up so the final empty-maps check in this block stays exact.
+  await req('DELETE', '/api/admin/prices/prod-nfc-stand', { ip: '10.0.0.50', headers: auth });
   const noAuthSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: { 'Content-Type': 'application/json' }, body: { id: 'logo', price: 10, sale_price: 7 } });
   check('discount POST rejects unauthenticated', noAuthSale.status === 401);
   const crossSale = await req('POST', '/api/admin/prices', { ip: '10.0.0.50', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example', ...auth }, body: { id: 'logo', price: 10, sale_price: 7 } });
@@ -628,6 +636,104 @@ let cookie = null;
   const inline = src.slice(scriptStart, scriptEnd);
   check('inline script has no backticks', !inline.includes('`'));
   check('inline script has no ${} interpolations', !inline.includes('${'));
+}
+
+// ---------- product prices + add-product (v6) ----------
+{
+  const auth = { Cookie: cookie };
+  const jsonHeaders = { 'Content-Type': 'application/json', ...auth };
+
+  // Product price override flows through /api/prices, catalog and quotes.
+  const pov = await req('POST', '/api/admin/prices', { ip: '10.0.0.60', headers: jsonHeaders, body: { id: 'prod-nfc-stand', price: 55 } });
+  const povData = await pov.json();
+  check('product price override 200', pov.status === 200 && povData.overridden === true && povData.price === 55, JSON.stringify(povData));
+  const pubP = await req('GET', '/api/prices', { ip: '10.0.0.61' });
+  const pubPData = await pubP.json();
+  check('public prices shows product override', pubPData.prices['prod-nfc-stand'] === 55, JSON.stringify(pubPData));
+  const catP = await req('GET', '/api/admin/catalog', { ip: '10.0.0.60', headers: auth });
+  const catPData = await catP.json();
+  check('catalog uses overridden product price', catPData.items.find((i) => i.id === 'prod-nfc-stand').price === 55);
+  const qP = await req('POST', '/api/admin/quotes', { ip: '10.0.0.60', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'prod-nfc-stand', qty: 2, price: 999 }] } });
+  const qPData = await qP.json();
+  check('quote charges overridden product price', qP.status === 200 && qPData.total_once === 110, JSON.stringify(qPData));
+  const povDef = await req('POST', '/api/admin/prices', { ip: '10.0.0.60', headers: jsonHeaders, body: { id: 'prod-nfc-stand', price: 50 } });
+  const povDefData = await povDef.json();
+  check('saving default product price removes override', povDef.status === 200 && povDefData.overridden === false, JSON.stringify(povDefData));
+  const pubP2 = await req('GET', '/api/prices', { ip: '10.0.0.61' });
+  const pubP2Data = await pubP2.json();
+  check('public prices drops removed product override', !('prod-nfc-stand' in pubP2Data.prices), JSON.stringify(pubP2Data));
+
+  // Add-product validation.
+  const noAuthAdd = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: { 'Content-Type': 'application/json' }, body: { name: 'X', price: 10 } });
+  check('add-product rejects unauthenticated', noAuthAdd.status === 401);
+  const emptyName = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: '   ', price: 10 } });
+  check('add-product rejects empty name', emptyName.status === 400);
+  const symName = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: '!!!', price: 10 } });
+  check('add-product rejects name with no letters', symName.status === 400);
+  const negPrice = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: 'Test', price: -1 } });
+  check('add-product rejects negative price', negPrice.status === 400);
+  const fracPrice = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: 'Test', price: 10.5 } });
+  check('add-product rejects fractional price', fracPrice.status === 400);
+  const bigPrice = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: 'Test', price: 100000 } });
+  check('add-product rejects price > 99999', bigPrice.status === 400);
+  const negStock = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: 'Test', price: 10, stock: -2 } });
+  check('add-product rejects negative stock', negStock.status === 400);
+  const crossAdd = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example', ...auth }, body: { name: 'Test', price: 10 } });
+  check('add-product rejects cross-site Origin', crossAdd.status === 403);
+
+  // Add a real product (Georgian name → transliterated slug).
+  const add = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: 'NFC სტიკერი — მწვანე', price: 18, stock: 7, incoming: 3 } });
+  const addData = await add.json();
+  check('add-product 200 with transliterated id', add.status === 200 && addData.id === 'prod-nfc-stikeri-mtsvane' && addData.slug === 'nfc-stikeri-mtsvane' && addData.price === 18 && addData.stock === 7 && addData.incoming === 3, JSON.stringify(addData));
+  const dup = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: 'NFC სტიკერი — მწვანე', price: 20, stock: 1 } });
+  check('add-product rejects duplicate name', dup.status === 400);
+  const dupSlug = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: 'NFC სტიკერი მწვანე', price: 20 } });
+  check('add-product rejects duplicate slug from different name', dupSlug.status === 400);
+  const collide = await req('POST', '/api/admin/products', { ip: '10.0.0.62', headers: jsonHeaders, body: { name: 'nfc stand', price: 20 } });
+  check('add-product rejects slug colliding with built-in product', collide.status === 400);
+
+  // The new product appears everywhere.
+  const pubS = await req('GET', '/api/stock', { ip: '10.0.0.63' });
+  const pubSData = await pubS.json();
+  check('public stock lists custom product', pubSData['nfc-stikeri-mtsvane'] && pubSData['nfc-stikeri-mtsvane'].stock === 7 && pubSData['nfc-stikeri-mtsvane'].incoming === 3, JSON.stringify(pubSData['nfc-stikeri-mtsvane']));
+  const admS = await req('GET', '/api/admin/stock', { ip: '10.0.0.62', headers: auth });
+  const admSData = await admS.json();
+  check('admin stock lists custom product with name + price', admSData['nfc-stikeri-mtsvane'] && admSData['nfc-stikeri-mtsvane'].custom === true && admSData['nfc-stikeri-mtsvane'].name === 'NFC სტიკერი — მწვანე' && admSData['nfc-stikeri-mtsvane'].price === 18 && admSData['nfc-stikeri-mtsvane'].stock === 7, JSON.stringify(admSData['nfc-stikeri-mtsvane']));
+  const admP = await req('GET', '/api/admin/prices', { ip: '10.0.0.62', headers: auth });
+  const admPData = await admP.json();
+  const customPriceRow = admPData.items.find((i) => i.id === 'prod-nfc-stikeri-mtsvane');
+  check('admin prices lists custom product (32 items)', admPData.items.length === 32 && customPriceRow && customPriceRow.defaultPrice === 18 && customPriceRow.group === 'NFC პროდუქტები' && customPriceRow.custom === true, 'n=' + admPData.items.length);
+  const catC = await req('GET', '/api/admin/catalog', { ip: '10.0.0.62', headers: auth });
+  const catCData = await catC.json();
+  check('catalog lists custom product (32 items)', catCData.items.length === 32 && catCData.items.find((i) => i.id === 'prod-nfc-stikeri-mtsvane').price === 18, 'n=' + catCData.items.length);
+  const qC = await req('POST', '/api/admin/quotes', { ip: '10.0.0.62', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'prod-nfc-stikeri-mtsvane', qty: 2 }] } });
+  const qCData = await qC.json();
+  check('quote charges custom product price', qC.status === 200 && qCData.total_once === 36, JSON.stringify(qCData));
+
+  // Custom product price override + reset.
+  const cov = await req('POST', '/api/admin/prices', { ip: '10.0.0.62', headers: jsonHeaders, body: { id: 'prod-nfc-stikeri-mtsvane', price: 22 } });
+  check('custom product override 200', cov.status === 200 && (await cov.json()).overridden === true);
+  const pubC = await req('GET', '/api/prices', { ip: '10.0.0.63' });
+  const pubCData = await pubC.json();
+  check('public prices shows custom override', pubCData.prices['prod-nfc-stikeri-mtsvane'] === 22, JSON.stringify(pubCData));
+  const qC2 = await req('POST', '/api/admin/quotes', { ip: '10.0.0.62', headers: jsonHeaders, body: { first_name: 'T', items: [{ id: 'prod-nfc-stikeri-mtsvane', qty: 1 }] } });
+  const qC2Data = await qC2.json();
+  check('quote charges overridden custom price', qC2.status === 200 && qC2Data.total_once === 22, JSON.stringify(qC2Data));
+  const cdel = await req('DELETE', '/api/admin/prices/prod-nfc-stikeri-mtsvane', { ip: '10.0.0.62', headers: auth });
+  const cdelData = await cdel.json();
+  check('custom override DELETE resets to base price', cdel.status === 200 && cdelData.price === 18, JSON.stringify(cdelData));
+
+  // Custom product stock updates through the same stock endpoint.
+  const sup = await req('POST', '/api/admin/stock', { ip: '10.0.0.62', headers: jsonHeaders, body: { slug: 'nfc-stikeri-mtsvane', stock: 5, incoming: null } });
+  check('stock upsert works for custom slug', sup.status === 200);
+  const pubS2 = await req('GET', '/api/stock', { ip: '10.0.0.63' });
+  const pubS2Data = await pubS2.json();
+  check('public stock reflects custom stock update', pubS2Data['nfc-stikeri-mtsvane'].stock === 5 && pubS2Data['nfc-stikeri-mtsvane'].incoming === null);
+
+  const page = await req('GET', '/admin');
+  const html = await page.text();
+  check('admin page has add-product form', html.includes('ახალი პროდუქტი') && html.includes('/api/admin/products') && html.includes('custom-rows') && html.includes('np-add'));
+  check('admin page still shows all 5 built-in slugs', SLUGS.every((s) => html.includes('data-row="' + s + '"')));
 }
 
 // ---------- logout ----------
