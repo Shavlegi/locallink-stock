@@ -10,10 +10,12 @@
  *
  * The admin UI is ONE self-contained HTML page embedded below — no static
  * files, no external assets, so there is no static-file allowlist to keep
- * in sync. It has three tabs: stock management, the quote calculator
- * (client cards with chosen services/products and totals), and service
- * price editing (overrides + optional sale prices that the shop picks up
- * via GET /api/prices; the discount % is computed from the two prices).
+ * in sync. It has three tabs: stock management (built-in + admin-added
+ * products, with a + form for new products), the quote calculator
+ * (client cards with chosen services/products and totals), and price
+ * editing for services AND products (overrides + optional sale prices;
+ * the shop picks service prices up via GET /api/prices; the discount %
+ * is computed from the two prices).
  *
  * Stock semantics: a missing row, or a NULL value, means "unset" — the
  * shop shows no stock line for that product. stock = 0 means "out of
@@ -68,8 +70,9 @@ const CATALOG = [
 ];
 const CATALOG_MAP = new Map(CATALOG.map((c) => [c.id, c]));
 
-// Price overrides apply to SERVICES ONLY — never to NFC products
-// (prod-* ids keep their fixed catalog prices).
+// Price overrides apply to services AND NFC products (prod-* ids).
+// A row in price_overrides / discounts wins over the CATALOG default
+// (or, for a custom product, over its stored base price).
 const SERVICE_CATALOG = CATALOG.filter((c) => !c.id.startsWith('prod-'));
 const SERVICE_ID_SET = new Set(SERVICE_CATALOG.map((c) => c.id));
 
@@ -305,8 +308,9 @@ async function ensureSchema(env) {
   } catch (e) {
     console.error('ensureSchema v3 error:', e && e.message ? e.message : e);
   }
-  // v4: price_overrides — admin-edited service prices. CATALOG holds the
-  // defaults; a row here wins. The shop fetches GET /api/prices.
+  // v4: price_overrides — admin-edited prices. CATALOG holds the
+  // defaults (custom products keep their base price in custom_products);
+  // a row here wins. The shop fetches GET /api/prices.
   try {
     const flag4 = await env.STOCK_DB.prepare(
       "SELECT value FROM schema_meta WHERE key = 'v4_price_overrides'",
@@ -327,9 +331,9 @@ async function ensureSchema(env) {
   } catch (e) {
     console.error('ensureSchema v4 error:', e && e.message ? e.message : e);
   }
-  // v5: discounts — optional per-service sale prices. The discount % is
-  // computed from the effective base price and the sale price, never
-  // stored. Services only, like price overrides.
+  // v5: discounts — optional sale prices per service or product. The
+  // discount % is computed from the effective base price and the sale
+  // price, never stored. Same scope as price overrides.
   try {
     const flag5 = await env.STOCK_DB.prepare(
       "SELECT value FROM schema_meta WHERE key = 'v5_discounts'",
@@ -349,6 +353,31 @@ async function ensureSchema(env) {
     }
   } catch (e) {
     console.error('ensureSchema v5 error:', e && e.message ? e.message : e);
+  }
+  // v6: custom_products — admin-added NFC products (id prod-<slug>).
+  // Their stock lives in the stock table keyed by slug, exactly like the
+  // five built-in products; their base price lives here.
+  try {
+    const flag6 = await env.STOCK_DB.prepare(
+      "SELECT value FROM schema_meta WHERE key = 'v6_custom_products'",
+    ).first();
+    if (!flag6 || flag6.value !== '1') {
+      await env.STOCK_DB.batch([
+        env.STOCK_DB.prepare(
+          'CREATE TABLE IF NOT EXISTS custom_products (' +
+          'id TEXT PRIMARY KEY, ' +
+          'slug TEXT NOT NULL UNIQUE, ' +
+          'name TEXT NOT NULL, ' +
+          'price INTEGER NOT NULL, ' +
+          'created_at INTEGER NOT NULL)',
+        ),
+        env.STOCK_DB.prepare(
+          "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('v6_custom_products', '1')",
+        ),
+      ]);
+    }
+  } catch (e) {
+    console.error('ensureSchema v6 error:', e && e.message ? e.message : e);
   }
   schemaChecked = true;
 }
@@ -494,10 +523,15 @@ async function handlePublicStock(env, request) {
   if (!allowed) return error('ძალიან ბევრი მოთხოვნა — ცოტა ხანში სცადეთ.', 429, corsHeaders(request));
   const out = {};
   for (const p of SLUGS) out[p.slug] = { stock: null, incoming: null };
+  const custom = await loadCustomProducts(env);
+  for (const cp of custom) out[cp.slug] = { stock: null, incoming: null };
   const { results } = await env.STOCK_DB.prepare('SELECT slug, stock, incoming FROM stock').all();
-  for (const row of results || []) {
-    if (SLUG_SET.has(row.slug)) {
-      out[row.slug] = {
+  const bySlug = new Map();
+  for (const row of results || []) bySlug.set(row.slug, row);
+  for (const slug of Object.keys(out)) {
+    const row = bySlug.get(slug);
+    if (row) {
+      out[slug] = {
         stock: row.stock === null || row.stock === undefined ? null : row.stock,
         incoming: row.incoming === null || row.incoming === undefined ? null : row.incoming,
       };
@@ -549,15 +583,21 @@ async function handleAdminStockGet(env, request) {
   const session = await requireSession(env, request);
   if (!session) return error('შესვლა საჭიროა.', 401);
   const out = {};
-  for (const p of SLUGS) out[p.slug] = { stock: null, incoming: null, updated_at: null };
+  for (const p of SLUGS) {
+    const entry = CATALOG_MAP.get('prod-' + p.slug);
+    out[p.slug] = { stock: null, incoming: null, updated_at: null, name: p.name, custom: false, id: 'prod-' + p.slug, price: entry ? entry.price : null };
+  }
+  const custom = await loadCustomProducts(env);
+  for (const cp of custom) {
+    out[cp.slug] = { stock: null, incoming: null, updated_at: null, name: cp.name, custom: true, id: cp.id, price: cp.price };
+  }
   const { results } = await env.STOCK_DB.prepare('SELECT slug, stock, incoming, updated_at FROM stock').all();
   for (const row of results || []) {
-    if (SLUG_SET.has(row.slug)) {
-      out[row.slug] = {
-        stock: row.stock === null || row.stock === undefined ? null : row.stock,
-        incoming: row.incoming === null || row.incoming === undefined ? null : row.incoming,
-        updated_at: row.updated_at,
-      };
+    const e = out[row.slug];
+    if (e) {
+      e.stock = row.stock === null || row.stock === undefined ? null : row.stock;
+      e.incoming = row.incoming === null || row.incoming === undefined ? null : row.incoming;
+      e.updated_at = row.updated_at;
     }
   }
   return json(out);
@@ -580,7 +620,10 @@ async function handleAdminStockPost(env, request) {
     return error('არასწორი მონაცემები.', 400);
   }
   const slug = body && body.slug;
-  if (typeof slug !== 'string' || !SLUG_SET.has(slug)) return error('არასწორი პროდუქტი.', 400);
+  if (typeof slug !== 'string') return error('არასწორი პროდუქტი.', 400);
+  const custom = await loadCustomProducts(env);
+  const customSlugSet = new Set(custom.map((c) => c.slug));
+  if (!SLUG_SET.has(slug) && !customSlugSet.has(slug)) return error('არასწორი პროდუქტი.', 400);
   const stock = parseQty(body.stock);
   const incoming = parseQty(body.incoming);
   if (!stock.ok || !incoming.ok) return error('რაოდენობა უნდა იყოს მთელი რიცხვი 0–99999 ან ცარიელი.', 400);
@@ -589,6 +632,93 @@ async function handleAdminStockPost(env, request) {
     'ON CONFLICT(slug) DO UPDATE SET stock = excluded.stock, incoming = excluded.incoming, updated_at = excluded.updated_at',
   ).bind(slug, stock.value, incoming.value, Date.now()).run();
   return json({ ok: true, slug, stock: stock.value, incoming: incoming.value });
+}
+
+// Georgian → latin transliteration for URL-safe product ids.
+const GEORGIAN_SLUG_MAP = {
+  ა: 'a', ბ: 'b', გ: 'g', დ: 'd', ე: 'e', ვ: 'v', ზ: 'z', თ: 't', ი: 'i',
+  კ: 'k', ლ: 'l', მ: 'm', ნ: 'n', ო: 'o', პ: 'p', ჟ: 'zh', რ: 'r', ს: 's',
+  ტ: 't', უ: 'u', ფ: 'f', ქ: 'k', ღ: 'gh', ყ: 'q', შ: 'sh', ჩ: 'ch',
+  ც: 'ts', ძ: 'dz', წ: 'ts', ჭ: 'ch', ხ: 'kh', ჯ: 'j', ჰ: 'h',
+};
+
+function slugifyName(name) {
+  let out = '';
+  for (const ch of String(name).toLowerCase()) {
+    if (GEORGIAN_SLUG_MAP[ch]) out += GEORGIAN_SLUG_MAP[ch];
+    else if (/[a-z0-9]/.test(ch)) out += ch;
+    else out += '-';
+  }
+  return out.replace(/-+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+}
+
+async function loadCustomProducts(env) {
+  try {
+    const { results } = await env.STOCK_DB.prepare(
+      'SELECT id, slug, name, price FROM custom_products ORDER BY created_at',
+    ).all();
+    return results || [];
+  } catch {
+    return [];
+  }
+}
+
+// The base (default) price of any priceable id: CATALOG default, or the
+// stored base price of a custom product. Null when the id is unknown.
+async function defaultPriceFor(env, id) {
+  const entry = CATALOG_MAP.get(id);
+  if (entry) return entry.price;
+  const custom = await loadCustomProducts(env);
+  const cp = custom.find((c) => c.id === id);
+  return cp ? cp.price : null;
+}
+
+async function isPriceableId(env, id) {
+  if (CATALOG_MAP.has(id)) return true;
+  const custom = await loadCustomProducts(env);
+  return custom.some((c) => c.id === id);
+}
+
+// POST /api/admin/products — add a new NFC product. The id is
+// prod-<slug> derived from the name; the slug must not collide with a
+// built-in product or an existing custom product.
+async function handleAdminProductsPost(env, request) {
+  if (!originAllowed(request)) return error('არასწორი წყარო (Origin).', 403);
+  const session = await requireSession(env, request);
+  if (!session) return error('შესვლა საჭიროა.', 401);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return error('არასწორი მონაცემები.', 400);
+  }
+  const name = cleanText(body && body.name, 100);
+  if (!name) return error('პროდუქტის სახელი აუცილებელია.', 400);
+  const price = body && body.price;
+  if (typeof price !== 'number' || !Number.isInteger(price) || price < 0 || price > CONFIG.maxQty) {
+    return error('ფასი უნდა იყოს მთელი რიცხვი 0–99999.', 400);
+  }
+  const stock = parseQty(body.stock);
+  const incoming = parseQty(body.incoming);
+  if (!stock.ok || !incoming.ok) return error('რაოდენობა უნდა იყოს მთელი რიცხვი 0–99999 ან ცარიელი.', 400);
+  const slug = slugifyName(name);
+  if (!slug) return error('სახელი ლათინურ ან ქართულ ასოებს უნდა შეიცავდეს.', 400);
+  const id = 'prod-' + slug;
+  if (CATALOG_MAP.has(id) || SLUG_SET.has(slug)) {
+    return error('ასეთი პროდუქტი უკვე არსებობს.', 400);
+  }
+  const existing = await env.STOCK_DB.prepare(
+    'SELECT id FROM custom_products WHERE id = ? OR slug = ?',
+  ).bind(id, slug).first();
+  if (existing) return error('ასეთი პროდუქტი უკვე არსებობს.', 400);
+  await env.STOCK_DB.prepare(
+    'INSERT INTO custom_products (id, slug, name, price, created_at) VALUES (?, ?, ?, ?, ?)',
+  ).bind(id, slug, name, price, Date.now()).run();
+  await env.STOCK_DB.prepare(
+    'INSERT INTO stock (slug, stock, incoming, updated_at) VALUES (?, ?, ?, ?) ' +
+    'ON CONFLICT(slug) DO UPDATE SET stock = excluded.stock, incoming = excluded.incoming, updated_at = excluded.updated_at',
+  ).bind(slug, stock.value, incoming.value, Date.now()).run();
+  return json({ ok: true, id, slug, name, price, stock: stock.value, incoming: incoming.value });
 }
 
 async function handleSecurityEvents(env, request) {
@@ -739,18 +869,22 @@ async function handleQuoteDelete(env, request, id) {
 
 async function loadOverrides(env) {
   const { results } = await env.STOCK_DB.prepare('SELECT id, price FROM price_overrides').all();
+  const custom = await loadCustomProducts(env);
+  const valid = new Set([...CATALOG_MAP.keys(), ...custom.map((c) => c.id)]);
   const map = new Map();
   for (const row of results || []) {
-    if (SERVICE_ID_SET.has(row.id) && Number.isInteger(row.price)) map.set(row.id, row.price);
+    if (valid.has(row.id) && Number.isInteger(row.price)) map.set(row.id, row.price);
   }
   return map;
 }
 
 async function loadDiscounts(env) {
   const { results } = await env.STOCK_DB.prepare('SELECT id, sale_price FROM discounts').all();
+  const custom = await loadCustomProducts(env);
+  const valid = new Set([...CATALOG_MAP.keys(), ...custom.map((c) => c.id)]);
   const map = new Map();
   for (const row of results || []) {
-    if (SERVICE_ID_SET.has(row.id) && Number.isInteger(row.sale_price)) map.set(row.id, row.sale_price);
+    if (valid.has(row.id) && Number.isInteger(row.sale_price)) map.set(row.id, row.sale_price);
   }
   return map;
 }
@@ -767,7 +901,7 @@ function discountPctFor(base, sale) {
 async function effectiveCatalog(env) {
   const overrides = await loadOverrides(env);
   const discounts = await loadDiscounts(env);
-  return CATALOG.map((c) => {
+  const items = CATALOG.map((c) => {
     const price = overrides.has(c.id) ? overrides.get(c.id) : c.price;
     const salePrice = discounts.has(c.id) ? discounts.get(c.id) : null;
     return {
@@ -779,8 +913,30 @@ async function effectiveCatalog(env) {
       editable: c.editable,
       salePrice,
       discountPct: salePrice === null ? null : discountPctFor(price, salePrice),
+      defaultPrice: c.price,
+      custom: false,
     };
   });
+  // Admin-added products join the same catalog (group 'NFC პროდუქტები')
+  // so they appear in the calculator, quotes and the Prices tab.
+  const custom = await loadCustomProducts(env);
+  for (const cp of custom) {
+    const price = overrides.has(cp.id) ? overrides.get(cp.id) : cp.price;
+    const salePrice = discounts.has(cp.id) ? discounts.get(cp.id) : null;
+    items.push({
+      id: cp.id,
+      group: 'NFC პროდუქტები',
+      name: cp.name,
+      price,
+      monthly: false,
+      editable: false,
+      salePrice,
+      discountPct: salePrice === null ? null : discountPctFor(price, salePrice),
+      defaultPrice: cp.price,
+      custom: true,
+    });
+  }
+  return items;
 }
 
 async function handlePublicPrices(env, request) {
@@ -798,25 +954,22 @@ async function handlePublicPrices(env, request) {
 async function handleAdminPricesGet(env, request) {
   const session = await requireSession(env, request);
   if (!session) return error('შესვლა საჭიროა.', 401);
+  const effective = await effectiveCatalog(env);
   const overrides = await loadOverrides(env);
-  const discounts = await loadDiscounts(env);
   return json({
-    items: SERVICE_CATALOG.map((c) => {
-      const price = overrides.has(c.id) ? overrides.get(c.id) : c.price;
-      const salePrice = discounts.has(c.id) ? discounts.get(c.id) : null;
-      return {
-        id: c.id,
-        group: c.group,
-        name: c.name,
-        price,
-        defaultPrice: c.price,
-        monthly: c.monthly,
-        editable: c.editable,
-        overridden: overrides.has(c.id),
-        salePrice,
-        discountPct: salePrice === null ? null : discountPctFor(price, salePrice),
-      };
-    }),
+    items: effective.map((c) => ({
+      id: c.id,
+      group: c.group,
+      name: c.name,
+      price: c.price,
+      defaultPrice: c.defaultPrice,
+      monthly: c.monthly,
+      editable: c.editable,
+      overridden: overrides.has(c.id),
+      salePrice: c.salePrice,
+      discountPct: c.discountPct,
+      custom: !!c.custom,
+    })),
   });
 }
 
@@ -831,7 +984,7 @@ async function handleAdminPricesPost(env, request) {
     return error('არასწორი მონაცემები.', 400);
   }
   const id = body && body.id;
-  if (typeof id !== 'string' || !SERVICE_ID_SET.has(id)) return error('არასწორი სერვისი.', 400);
+  if (typeof id !== 'string' || !(await isPriceableId(env, id))) return error('არასწორი სერვისი ან პროდუქტი.', 400);
   const price = body && body.price;
   if (typeof price !== 'number' || !Number.isInteger(price) || price < 0 || price > CONFIG.maxQty) {
     return error('ფასი უნდა იყოს მთელი რიცხვი 0–99999.', 400);
@@ -850,9 +1003,9 @@ async function handleAdminPricesPost(env, request) {
     }
     salePrice = saleRaw;
   }
-  const entry = CATALOG_MAP.get(id);
+  const defaultPrice = await defaultPriceFor(env, id);
   let overridden;
-  if (price === entry.price) {
+  if (price === defaultPrice) {
     // Saving the default removes the override.
     await env.STOCK_DB.prepare('DELETE FROM price_overrides WHERE id = ?').bind(id).run();
     overridden = false;
@@ -885,9 +1038,11 @@ async function handlePriceDelete(env, request, id) {
   if (!originAllowed(request)) return error('არასწორი წყარო (Origin).', 403);
   const session = await requireSession(env, request);
   if (!session) return error('შესვლა საჭიროა.', 401);
+  const defaultPrice = await defaultPriceFor(env, id);
+  if (defaultPrice === null) return error('არასწორი სერვისი ან პროდუქტი.', 400);
   await env.STOCK_DB.prepare('DELETE FROM price_overrides WHERE id = ?').bind(id).run();
   await env.STOCK_DB.prepare('DELETE FROM discounts WHERE id = ?').bind(id).run();
-  return json({ ok: true, id, price: CATALOG_MAP.get(id).price, salePrice: null, discountPct: null });
+  return json({ ok: true, id, price: defaultPrice, salePrice: null, discountPct: null });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1035,6 +1190,16 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
     <div id="tab-stock">
       <p class="sub">ცარიელი ველი = რაოდენობა არ ჩანს მაღაზიაში.</p>
       <div id="rows">${adminRowsHtml()}</div>
+      <div id="custom-rows"></div>
+      <div class="card" id="add-product-card">
+        <h2>ახალი პროდუქტი</h2>
+        <div class="field"><label for="np-name">სახელი *</label><input id="np-name" type="text" autocomplete="off" placeholder="მაგ. NFC სტიკერი — მწვანე"></div>
+        <div class="field"><label for="np-price">ფასი (₾) *</label><input id="np-price" type="number" inputmode="numeric" min="0" max="99999" placeholder="0"></div>
+        <div class="field"><label for="np-stock">მარაგშია (ცალი)</label><input id="np-stock" type="number" inputmode="numeric" min="0" max="99999" placeholder="—"></div>
+        <div class="field"><label for="np-incoming">მალე დაემატება (ცალი)</label><input id="np-incoming" type="number" inputmode="numeric" min="0" max="99999" placeholder="—"></div>
+        <div class="err" id="np-err" hidden></div>
+        <button class="btn btn-block" id="np-add" type="button">+ პროდუქტის დამატება</button>
+      </div>
       <div class="card">
         <h2>უსაფრთხოების მოვლენები</h2>
         <div id="sec-events"><p class="sub">იტვირთება…</p></div>
@@ -1058,7 +1223,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
       <div id="quote-list"></div>
     </div>
     <div id="tab-prices" hidden>
-      <p class="sub">ფასის და ფასდაკლების შეცვლა მაშინვე აისახება საიტზე და კალკულატორში.</p>
+      <p class="sub">ფასის და ფასდაკლების შეცვლა მაშინვე აისახება კალკულატორში; სერვისების ფასები — საიტზეც.</p>
       <div class="err" id="prices-err" hidden></div>
       <div id="price-rows"><p class="sub">იტვირთება…</p></div>
     </div>
@@ -1080,7 +1245,7 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
       if (!res.ok) throw new Error('auth');
       return res.json();
     }).then(function (data) {
-      var rows = document.querySelectorAll('[data-row]');
+      var rows = document.querySelectorAll('#rows [data-row]');
       for (var i = 0; i < rows.length; i++) {
         var slug = rows[i].getAttribute('data-row');
         var e = data[slug] || {};
@@ -1089,7 +1254,36 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
         s.value = (e.stock === null || e.stock === undefined) ? '' : String(e.stock);
         inc.value = (e.incoming === null || e.incoming === undefined) ? '' : String(e.incoming);
       }
+      renderCustomRows(data);
     });
+  }
+
+  // Admin-added products render as stock rows just like the built-in
+  // ones (same stepper/save wiring via the delegated click handler).
+  function renderCustomRows(data) {
+    var box = document.getElementById('custom-rows');
+    var out = '';
+    var slugs = Object.keys(data || {});
+    for (var i = 0; i < slugs.length; i++) {
+      var e = data[slugs[i]];
+      if (!e || !e.custom) continue;
+      var sVal = (e.stock === null || e.stock === undefined) ? '' : String(e.stock);
+      var iVal = (e.incoming === null || e.incoming === undefined) ? '' : String(e.incoming);
+      out += '<div class="card" data-row="' + slugs[i] + '">' +
+        '<h2>' + escHtml(e.name) + '</h2>' +
+        '<div class="row"><label>მარაგშია (ცალი)</label>' +
+          '<span class="stepper"><button type="button" data-step="-1" aria-label="−">−</button>' +
+          '<input class="stock-input" type="number" inputmode="numeric" min="0" max="99999" placeholder="—" value="' + sVal + '">' +
+          '<button type="button" data-step="1" aria-label="+">+</button></span>' +
+        '</div>' +
+        '<div class="row"><label>მალე დაემატება (ცალი)</label>' +
+          '<input class="num incoming-input" type="number" inputmode="numeric" min="0" max="99999" placeholder="—" value="' + iVal + '">' +
+        '</div>' +
+        '<button class="btn" type="button" data-save>შენახვა</button>' +
+        '<span class="saved" hidden>შენახულია ✓</span>' +
+      '</div>';
+    }
+    box.innerHTML = out;
   }
 
   function checkSession() {
@@ -1182,6 +1376,51 @@ label.fl{display:block;font-weight:600;font-size:14px;margin-bottom:6px}
         saveBtn.disabled = false;
       });
     }
+  });
+
+  /* Add a new product (+ button in the stock tab). */
+
+  document.getElementById('np-add').addEventListener('click', function () {
+    var errBox = document.getElementById('np-err');
+    errBox.hidden = true;
+    var name = document.getElementById('np-name').value.trim();
+    var priceVal = document.getElementById('np-price').value.trim();
+    var stockVal = document.getElementById('np-stock').value.trim();
+    var incVal = document.getElementById('np-incoming').value.trim();
+    var price = priceVal === '' ? NaN : parseInt(priceVal, 10);
+    var stock = stockVal === '' ? null : parseInt(stockVal, 10);
+    var incoming = incVal === '' ? null : parseInt(incVal, 10);
+    if (!name) { errBox.textContent = 'პროდუქტის სახელი აუცილებელია.'; errBox.hidden = false; return; }
+    if (isNaN(price) || price < 0 || price > 99999) { errBox.textContent = 'ფასი უნდა იყოს მთელი რიცხვი 0–99999.'; errBox.hidden = false; return; }
+    if ((stock !== null && (isNaN(stock) || stock < 0 || stock > 99999)) ||
+        (incoming !== null && (isNaN(incoming) || incoming < 0 || incoming > 99999))) {
+      errBox.textContent = 'რაოდენობა უნდა იყოს მთელი რიცხვი 0–99999 ან ცარიელი.';
+      errBox.hidden = false;
+      return;
+    }
+    var btn = document.getElementById('np-add');
+    btn.disabled = true;
+    fetch('/api/admin/products', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, price: price, stock: stock, incoming: incoming })
+    }).then(function (res) {
+      if (!res.ok) return res.json().then(function (d) { throw new Error((d && d.error) || 'save'); });
+      return res.json();
+    }).then(function () {
+      btn.disabled = false;
+      document.getElementById('np-name').value = '';
+      document.getElementById('np-price').value = '';
+      document.getElementById('np-stock').value = '';
+      document.getElementById('np-incoming').value = '';
+      catalogLoaded = false;
+      pricesLoaded = false;
+      return loadStock();
+    }).catch(function (e) {
+      btn.disabled = false;
+      errBox.textContent = (e && e.message && e.message !== 'save') ? e.message : 'ვერ დაემატა. სცადეთ თავიდან.';
+      errBox.hidden = false;
+    });
   });
 
   /* Calculator tabs, form and quote cards. */
@@ -1719,6 +1958,9 @@ export default {
     if (path === '/api/admin/stock' && request.method === 'POST') {
       return handleAdminStockPost(env, request);
     }
+    if (path === '/api/admin/products' && request.method === 'POST') {
+      return handleAdminProductsPost(env, request);
+    }
     if (path === '/api/admin/security-events' && request.method === 'GET') {
       return handleSecurityEvents(env, request);
     }
@@ -1746,8 +1988,8 @@ export default {
     }
     if (path.startsWith('/api/admin/prices/') && request.method === 'DELETE') {
       const id = path.slice('/api/admin/prices/'.length);
-      if (!SERVICE_ID_SET.has(id)) {
-        return error('არასწორი სერვისი.', 400);
+      if (!(await isPriceableId(env, id))) {
+        return error('არასწორი სერვისი ან პროდუქტი.', 400);
       }
       return handlePriceDelete(env, request, id);
     }
